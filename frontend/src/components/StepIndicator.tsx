@@ -1,0 +1,74 @@
+import { Check } from "lucide-react";
+import { useLanguage } from "@/context/LanguageContext";
+
+interface StepIndicatorProps {
+  currentStep: number;
+  maxUnlockedStep?: number;
+  onStepClick?: (stepIndex: number) => void;
+}
+
+const StepIndicator = ({ currentStep, maxUnlockedStep = currentStep, onStepClick }: StepIndicatorProps) => {
+  const { language } = useLanguage();
+
+  const steps = [
+    { id: 1, label: language === "th" ? "อัปโหลดภาพ" : "Upload" },
+    { id: 2, label: language === "th" ? "สถานที่ท่องเที่ยว" : "Locations" },
+    { id: 3, label: language === "th" ? "สไตล์ & ความต้องการ" : "Preferences" },
+    { id: 4, label: language === "th" ? "ตารางท่องเที่ยว" : "Itinerary" },
+  ];
+  return (
+    <div className="mb-8 flex items-center justify-center">
+      <ol className="flex items-center gap-1.5 sm:gap-2">
+        {steps.map((step, i) => {
+          const isComplete = i < currentStep;
+          const isCurrent = i === currentStep;
+          const isUnlocked = i <= maxUnlockedStep || i <= currentStep;
+
+          return (
+            <li key={step.id} className="flex items-center gap-1.5 sm:gap-2">
+              <button
+                type="button"
+                disabled={!isUnlocked}
+                onClick={() => isUnlocked && onStepClick?.(i)}
+                className={`flex items-center gap-2 rounded-full px-2.5 py-1.5 text-xs font-semibold transition-all sm:px-3.5 sm:text-sm ${
+                  isCurrent
+                    ? "bg-slate-900 text-white dark:bg-white dark:text-slate-900 shadow-xs"
+                    : isUnlocked
+                    ? "text-foreground hover:bg-secondary cursor-pointer"
+                    : "cursor-not-allowed text-muted-foreground/40 pointer-events-none"
+                }`}
+              >
+                <span
+                  className={`flex size-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${
+                    isCurrent
+                      ? "bg-white/20 text-white dark:bg-black/20 dark:text-slate-900"
+                      : isComplete
+                      ? "bg-sky-500 text-white"
+                      : isUnlocked
+                      ? "bg-sky-500/20 text-sky-600 dark:text-sky-400 border border-sky-500/30"
+                      : "bg-secondary text-muted-foreground"
+                  }`}
+                >
+                  {isComplete ? <Check className="size-3 stroke-[3]" /> : step.id}
+                </span>
+                <span className="hidden sm:inline">{step.label}</span>
+              </button>
+
+              {i < steps.length - 1 && (
+                <div
+                  className={`h-px w-4 sm:w-8 transition-colors ${
+                    i < maxUnlockedStep ? "bg-sky-500/70" : "bg-border"
+                  }`}
+                />
+              )}
+            </li>
+          );
+        })}
+
+      </ol>
+    </div>
+  );
+};
+
+export default StepIndicator;
+

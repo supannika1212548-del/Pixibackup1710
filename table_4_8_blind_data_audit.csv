@@ -1,0 +1,3 @@
+﻿Eval_ID,Scenario_ID,Trip_ID,Blind_Label,Actual_Model,Expert_Name,Expert_ID,Overall_Pick,Submitted_At,Spatial_Feasibility,Temporal_Pacing,Persona_Alignment,Attraction_Quality,Info_Accuracy,Mean_Score
+eval_a17a6fbe,SC-01,trip_acc054d5,แผน A,openai-gpt-54,Expert 1,expert@tourism.ac.th,True,2026-09-16 19:27:52,5,4,5,4,5,4.6
+eval_a4cc964a,SC-01,trip_ce833635,แผน A,google-gemini-38-flash,Expert 2,thanawich999@gmail.com,False,2026-09-17 20:43:10,4,4,4,4,4,4.0

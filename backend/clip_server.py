@@ -1,0 +1,4385 @@
+import os
+import re
+import threading
+from dotenv import load_dotenv
+load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+import json
+import time
+import datetime
+import base64
+from io import BytesIO
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+import torch
+from PIL import Image
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+import open_clip
+import requests
+import xml.etree.ElementTree as ET
+import urllib.parse
+
+import google.generativeai as genai
+from openai import OpenAI
+
+# --------------------
+# AI Config
+# --------------------
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY")
+DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+GEOAPIFY_API_KEY = os.getenv("GEOAPIFY_API_KEY", "f5da5b71d4814a67b02fcef0b4525897")
+MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN")
+FOURSQUARE_API_KEY = os.getenv("FOURSQUARE_API_KEY")
+
+# Primary AI Client: OpenRouter (OpenAI SDK compatible)
+ai_api_key = OPENROUTER_API_KEY or OPENAI_API_KEY
+if ai_api_key:
+    openrouter_client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=ai_api_key,
+        default_headers={
+            "HTTP-Referer": "https://vision-trip-planner.vercel.app",
+            "X-Title": "Pixinerary",
+        }
+    )
+else:
+    openrouter_client = None
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+
+# --------------------
+# OpenRouter Generation Analytics & Server-Side Timing Cache
+# --------------------
+generation_stats_cache = {}
+generation_stats_lock = threading.Lock()
+
+def fetch_openrouter_generation_stats(gen_id, max_retries=6, initial_delay=2.0):
+    """
+    Fetches real server-side generation stats (generation_time, latency, provider_name)
+    from OpenRouter API https://openrouter.ai/api/v1/generation?id={gen_id}.
+    """
+    if not gen_id or not OPENROUTER_API_KEY:
+        return None
+    with generation_stats_lock:
+        if gen_id in generation_stats_cache:
+            return generation_stats_cache[gen_id]
+
+    url = f"https://openrouter.ai/api/v1/generation?id={gen_id}"
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+
+    if initial_delay > 0:
+        time.sleep(initial_delay)
+
+    for attempt in range(max_retries):
+        try:
+            res = requests.get(url, headers=headers, timeout=6)
+            if res.status_code == 200:
+                data = res.json().get("data", {})
+                gen_time = data.get("generation_time")
+                gateway_lat = data.get("latency")
+                provider = data.get("provider_name") or ""
+                res_obj = {
+                    "generation_time_ms": int(gen_time) if gen_time is not None else None,
+                    "gateway_latency_ms": int(gateway_lat) if gateway_lat is not None else None,
+                    "provider_name": str(provider),
+                }
+                with generation_stats_lock:
+                    generation_stats_cache[gen_id] = res_obj
+                print(f"[OpenRouter Stats] Cached for {gen_id}: gen_time={gen_time}ms, provider={provider}")
+                return res_obj
+            elif res.status_code == 404 and attempt < max_retries - 1:
+                time.sleep(1.0)
+        except Exception as e:
+            print(f"[OpenRouter Stats] Error fetching stats for {gen_id}: {e}")
+            break
+    # Cache negative lookup to prevent hammering API for expired/unknown IDs
+    with generation_stats_lock:
+        generation_stats_cache[gen_id] = {"generation_time_ms": None, "gateway_latency_ms": None, "provider_name": ""}
+    return None
+
+def get_generation_metrics(gen_id, completion_tokens):
+    """Helper to retrieve pure generation time, pure TPS, and provider from cache/API."""
+    if not gen_id:
+        return {"generation_time_ms": "", "pure_tokens_per_sec": "", "provider_name": "", "openrouter_id": ""}
+    
+    with generation_stats_lock:
+        stats = generation_stats_cache.get(gen_id)
+    if not stats:
+        # Quick fallback fetch if not yet in cache (up to 3 attempts, 0.5s delay)
+        stats = fetch_openrouter_generation_stats(gen_id, max_retries=3, initial_delay=0.5)
+    
+    gen_time = stats.get("generation_time_ms") if stats else None
+    provider = stats.get("provider_name") if stats else ""
+    try:
+        c_tokens = int(float(completion_tokens or 0))
+    except (ValueError, TypeError):
+        c_tokens = 0
+    pure_tps = round(c_tokens / (gen_time / 1000.0), 2) if (gen_time and gen_time > 0 and c_tokens > 0) else ""
+
+    return {
+        "generation_time_ms": gen_time if gen_time is not None else "",
+        "pure_tokens_per_sec": pure_tps,
+        "provider_name": provider,
+        "openrouter_id": gen_id
+    }
+
+def backfill_csv_generation_stats(csv_path):
+    """
+    Spawns a daemon thread to scan a CSV file for rows with an OpenRouter ID but missing
+    Generation Time MS, without blocking the HTTP response.
+    """
+    def _run():
+        import csv
+        if not os.path.exists(csv_path):
+            return
+        try:
+            rows = []
+            updated = False
+            with open(csv_path, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                if not fieldnames:
+                    return
+                has_id = "OpenRouter ID" in fieldnames or "OpenRouter ID CLIP" in fieldnames
+                if not has_id:
+                    return
+                for r in reader:
+                    # Handle single model CSVs (Exp 1, 3, 4, 5)
+                    if "OpenRouter ID" in fieldnames:
+                        gen_id = r.get("OpenRouter ID") or ""
+                        gen_time = r.get("Generation Time MS") or ""
+                        if gen_id and not gen_time:
+                            metrics = get_generation_metrics(gen_id, r.get("Completion Tokens") or r.get("Tokens") or 0)
+                            if metrics.get("generation_time_ms"):
+                                r["Generation Time MS"] = metrics["generation_time_ms"]
+                                r["Pure Tokens Per Sec"] = metrics["pure_tokens_per_sec"]
+                                if not r.get("Provider Name"):
+                                    r["Provider Name"] = metrics["provider_name"]
+                                updated = True
+                    
+                    # Handle Exp 2 (dual pipeline)
+                    if "OpenRouter ID CLIP" in fieldnames:
+                        gen_id_clip = r.get("OpenRouter ID CLIP") or ""
+                        gen_time_clip = r.get("Gen Time CLIP (ms)") or ""
+                        if gen_id_clip and not gen_time_clip:
+                            m_clip = get_generation_metrics(gen_id_clip, r.get("Tokens CLIP") or 0)
+                            if m_clip.get("generation_time_ms"):
+                                r["Gen Time CLIP (ms)"] = m_clip["generation_time_ms"]
+                                r["Pure TPS CLIP"] = m_clip["pure_tokens_per_sec"]
+                                r["Provider CLIP"] = m_clip["provider_name"]
+                                updated = True
+
+                        gen_id_noclip = r.get("OpenRouter ID No CLIP") or ""
+                        gen_time_noclip = r.get("Gen Time No CLIP (ms)") or ""
+                        if gen_id_noclip and not gen_time_noclip:
+                            m_noclip = get_generation_metrics(gen_id_noclip, r.get("Tokens No CLIP") or 0)
+                            if m_noclip.get("generation_time_ms"):
+                                r["Gen Time No CLIP (ms)"] = m_noclip["generation_time_ms"]
+                                r["Pure TPS No CLIP"] = m_noclip["pure_tokens_per_sec"]
+                                r["Provider No CLIP"] = m_noclip["provider_name"]
+                                updated = True
+
+                    rows.append(r)
+            
+            if updated:
+                with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(rows)
+                print(f"[Backfill] Updated missing generation stats in {csv_path}")
+        except Exception as e:
+            print(f"[Backfill Warning] Failed to backfill stats in {csv_path}: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+
+
+# --------------------
+# Flask & Universal CORS setup
+# --------------------
+
+app = Flask(__name__)
+
+# Allowed origins list - includes Vercel production, preview deployments, and localhost
+ALLOWED_ORIGIN_PATTERNS = [
+    re.compile(r"^https://.*\.vercel\.app$"),
+    re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"),
+]
+
+def get_cors_origin(incoming_origin):
+    """Dynamically determine allowed CORS origin with credentials support."""
+    if not incoming_origin:
+        return "*"
+    for pattern in ALLOWED_ORIGIN_PATTERNS:
+        if pattern.match(incoming_origin):
+            return incoming_origin
+    # Fallback: reflect incoming origin so deploy/preview environments are never blocked
+    return incoming_origin
+
+# Flask-CORS as primary layer
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=True,
+    allow_headers=["*"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
+    max_age=86400,
+)
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        origin = get_cors_origin(request.headers.get("Origin"))
+        req_headers = request.headers.get(
+            "Access-Control-Request-Headers",
+            "Content-Type, Authorization, X-Requested-With, Accept, Origin, Range, X-Client-Version, apikey"
+        )
+        res = app.make_default_options_response()
+        res.status_code = 204
+        res.headers["Access-Control-Allow-Origin"] = origin
+        res.headers["Access-Control-Allow-Credentials"] = "true"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"
+        res.headers["Access-Control-Allow-Headers"] = req_headers
+        res.headers["Access-Control-Max-Age"] = "86400"
+        return res
+
+@app.after_request
+def add_cors_headers(response):
+    origin = get_cors_origin(request.headers.get("Origin"))
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, X-Requested-With, Accept, Origin, Range, X-Client-Version, apikey"
+    )
+    return response
+
+from werkzeug.exceptions import HTTPException
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Ensure unhandled exceptions still return JSON with proper CORS headers."""
+    code = 500
+    if isinstance(e, HTTPException):
+        code = e.code
+    else:
+        import traceback
+        traceback.print_exc()
+
+    origin = get_cors_origin(request.headers.get("Origin"))
+    response = jsonify({
+        "error": str(e),
+        "status": "error",
+        "code": code,
+    })
+    response.status_code = code
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, X-Requested-With, Accept, Origin, Range, X-Client-Version, apikey"
+    )
+    return response
+
+# WSGI level safeguard: ensures 404, 500, or any proxy-level Flask error carries CORS headers
+class CorsMiddleware:
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        origin = environ.get("HTTP_ORIGIN", "*")
+        method = environ.get("REQUEST_METHOD", "")
+
+        if method == "OPTIONS":
+            headers = [
+                ("Access-Control-Allow-Origin", origin),
+                ("Access-Control-Allow-Credentials", "true"),
+                ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"),
+                ("Access-Control-Allow-Headers", environ.get("HTTP_ACCESS_CONTROL_REQUEST_HEADERS", "Content-Type, Authorization, X-Requested-With, Accept, Origin, Range, X-Client-Version, apikey")),
+                ("Access-Control-Max-Age", "86400"),
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+            ]
+            start_response("204 No Content", headers)
+            return [b""]
+
+        def custom_start_response(status, response_headers, exc_info=None):
+            header_keys = [h[0].lower() for h in response_headers]
+            if "access-control-allow-origin" not in header_keys:
+                response_headers.append(("Access-Control-Allow-Origin", origin))
+            if "access-control-allow-credentials" not in header_keys:
+                response_headers.append(("Access-Control-Allow-Credentials", "true"))
+            if "access-control-allow-methods" not in header_keys:
+                response_headers.append(("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"))
+            if "access-control-allow-headers" not in header_keys:
+                response_headers.append(("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin, Range, X-Client-Version, apikey"))
+            return start_response(status, response_headers, exc_info)
+
+        return self.wsgi_app(environ, custom_start_response)
+
+app.wsgi_app = CorsMiddleware(app.wsgi_app)
+
+# --------------------
+# Device
+# --------------------
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+if device == "cpu":
+    try:
+        torch.set_num_threads(2)
+    except Exception:
+        pass
+
+# --------------------
+# Eager-load model
+# --------------------
+
+import threading
+
+_model_lock = threading.Lock()
+model = None
+preprocess = None
+
+
+def load_model():
+    """Load CLIP model if not already loaded (thread-safe)."""
+    global model, preprocess
+
+    if model is not None:
+        return
+
+    with _model_lock:
+        if model is None:
+            print("Loading CLIP model...")
+
+            model_instance, _, preprocess_instance = open_clip.create_model_and_transforms(
+                "ViT-B-32",
+                pretrained="openai"
+            )
+
+            model_instance.to(device)
+            model_instance.eval()
+
+            preprocess = preprocess_instance
+            model = model_instance
+            print(f"CLIP model loaded successfully on {device}!")
+
+
+# --------------------
+# Health check
+# --------------------
+
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "running"
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok"
+    })
+
+
+# --------------------
+# Embedding from upload
+# --------------------
+
+@app.route("/embedding", methods=["POST"])
+def get_embedding():
+
+    load_model()
+
+    if "image" not in request.files:
+        return jsonify({"error": "No image provided"}), 400
+
+    try:
+        file = request.files["image"]
+
+        img = Image.open(file).convert("RGB")
+
+        img_preprocessed = preprocess(img).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+
+            image_features = model.encode_image(img_preprocessed)
+
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+
+            embedding_list = (
+                image_features.cpu()
+                .numpy()
+                .flatten()
+                .tolist()
+            )
+
+        return jsonify(embedding_list)
+
+    except Exception as e:
+        print("Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# Embedding from URL
+# --------------------
+
+@app.route("/embedding_url", methods=["POST"])
+def get_embedding_url():
+    load_model()
+
+    data = request.get_json(silent=True)
+    if not data or "url" not in data:
+        return jsonify({"error": "No URL provided"}), 400
+
+    raw_url = str(data["url"]).strip()
+    if not raw_url:
+        return jsonify({"error": "Empty URL provided"}), 400
+
+    img = None
+    try:
+        # Case A: Base64 data URL
+        if raw_url.startswith("data:image/"):
+            import base64
+            if "," in raw_url:
+                _, b64_data = raw_url.split(",", 1)
+            else:
+                b64_data = raw_url
+            img_bytes = base64.b64decode(b64_data)
+            img = Image.open(BytesIO(img_bytes)).convert("RGB")
+
+        # Case B: Local relative path or internal URL (e.g. /images/...)
+        elif not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+            clean_path = raw_url.lstrip("/\\")
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            candidates = [
+                os.path.join(base_dir, "frontend", "public", clean_path),
+                os.path.join(base_dir, "frontend", "dist", clean_path),
+                os.path.join(base_dir, "backend", clean_path),
+                os.path.join(base_dir, clean_path),
+            ]
+            for c in candidates:
+                if os.path.exists(c) and os.path.isfile(c):
+                    try:
+                        img = Image.open(c).convert("RGB")
+                        break
+                    except Exception:
+                        pass
+
+            if img is None:
+                # Try fetching from local Vite dev server
+                dev_url = f"http://127.0.0.1:5173/{clean_path}"
+                try:
+                    dev_res = requests.get(dev_url, timeout=3)
+                    if dev_res.ok:
+                        img = Image.open(BytesIO(dev_res.content)).convert("RGB")
+                except Exception:
+                    pass
+
+            if img is None:
+                print(f"[Warning /embedding_url] Local asset not found: '{raw_url}'")
+                return jsonify({"error": f"Local image not found: {raw_url}"}), 404
+
+        # Case C: Remote HTTP / HTTPS URL
+        else:
+            fetch_url = raw_url
+            headers = {
+                "User-Agent": "PixineraryBot/1.0 (https://vision-trip-planner.vercel.app; info@pixinerary.app) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "image/jpeg,image/png,image/webp,image/*,*/*;q=0.8",
+                "Referer": "https://www.google.com/"
+            }
+
+            # Normalize Unsplash CDN image URLs
+            if "images.unsplash.com" in fetch_url:
+                if "auto=format" in fetch_url:
+                    fetch_url = fetch_url.replace("auto=format", "fm=jpg")
+                elif "fm=" not in fetch_url:
+                    fetch_url += ("&" if "?" in fetch_url else "?") + "fm=jpg"
+
+            try:
+                response = requests.get(fetch_url, headers=headers, timeout=8)
+                response.raise_for_status()
+                img = Image.open(BytesIO(response.content)).convert("RGB")
+            except Exception as first_err:
+                # Fallback 1: Wikimedia thumbnail error -> fetch original full image without /thumb/
+                if "upload.wikimedia.org" in fetch_url and "/thumb/" in fetch_url:
+                    try:
+                        parts = fetch_url.split("/thumb/")
+                        if len(parts) == 2:
+                            orig_url = parts[0] + "/" + "/".join(parts[1].split("/")[:-1])
+                            fb_res = requests.get(orig_url, headers=headers, timeout=8)
+                            if fb_res.ok:
+                                img = Image.open(BytesIO(fb_res.content)).convert("RGB")
+                    except Exception:
+                        pass
+
+                # Fallback 2: Unsplash fallback URL
+                if img is None and "images.unsplash.com" in raw_url:
+                    try:
+                        fallback_url = raw_url.split("?")[0] + "?w=800&q=80&fm=jpg"
+                        fb_res = requests.get(fallback_url, headers=headers, timeout=8)
+                        if fb_res.ok:
+                            img = Image.open(BytesIO(fb_res.content)).convert("RGB")
+                    except Exception:
+                        pass
+
+                if img is None:
+                    print(f"[Warning /embedding_url] Could not download image from '{raw_url}': {first_err}")
+                    return jsonify({"error": f"Failed to download image: {first_err}"}), 422
+
+        if img is None:
+            return jsonify({"error": "Unable to process image data"}), 422
+
+        img_preprocessed = preprocess(img).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            image_features = model.encode_image(img_preprocessed)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            embedding_list = image_features.cpu().numpy().flatten().tolist()
+
+        return jsonify(embedding_list)
+
+    except Exception as e:
+        print("[Error in /embedding_url]:", e)
+        return jsonify({"error": str(e)}), 422
+
+
+# --------------------
+# Foursquare Places API Proxy (Bypasses Browser CORS)
+# --------------------
+
+@app.route("/foursquare/search", methods=["GET"])
+def foursquare_search():
+    query = request.args.get("query", "").strip()
+    ll = request.args.get("ll", "").strip()
+    radius = request.args.get("radius", "50000").strip()
+    limit = request.args.get("limit", "1").strip()
+
+    api_key = FOURSQUARE_API_KEY or os.getenv("FOURSQUARE_API_KEY", "")
+    if not api_key or len(api_key) < 5:
+        return jsonify({"results": []})
+
+    auth_header = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key.strip()}"
+    headers = {
+        "Authorization": auth_header,
+        "X-Places-Api-Version": "2025-06-17",
+        "Accept": "application/json"
+    }
+    params = {
+        "query": query,
+        "limit": limit
+    }
+    if ll:
+        params["ll"] = ll
+        params["radius"] = radius
+
+    try:
+        res = requests.get(
+            "https://places-api.foursquare.com/places/search",
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        if res.status_code in (429, 402):
+            return jsonify({"results": [], "exhausted": True}), 200
+        return jsonify(res.json()), res.status_code
+    except Exception as e:
+        print("Foursquare search error:", e)
+        return jsonify({"error": str(e), "results": []}), 200
+
+
+@app.route("/foursquare/photos/<place_id>", methods=["GET"])
+def foursquare_photos(place_id):
+    limit = request.args.get("limit", "10").strip()
+    api_key = FOURSQUARE_API_KEY or os.getenv("FOURSQUARE_API_KEY", "")
+    if not api_key or len(api_key) < 5:
+        return jsonify([])
+
+    auth_header = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key.strip()}"
+    headers = {
+        "Authorization": auth_header,
+        "X-Places-Api-Version": "2025-06-17",
+        "Accept": "application/json"
+    }
+    params = {"limit": limit}
+    try:
+        res = requests.get(
+            f"https://places-api.foursquare.com/places/{place_id}/photos",
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        if res.status_code == 200:
+            return jsonify(res.json()), 200
+        else:
+            return jsonify([]), 200
+    except Exception as e:
+        print("Foursquare photos error:", e)
+        return jsonify([]), 200
+
+
+# --------------------
+# Google Maps Link Resolver
+# --------------------
+
+@app.route("/resolve_maps_url", methods=["GET", "POST"])
+def resolve_maps_url():
+    """
+    Expands short Google Maps links (e.g. maps.app.goo.gl, goo.gl/maps)
+    and extracts accommodation/place name, coordinates (lat, lng), and static photo.
+    """
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        raw_input = data.get("url") or data.get("query") or ""
+    else:
+        raw_input = request.args.get("url") or request.args.get("query") or ""
+
+    if not raw_input or not isinstance(raw_input, str):
+        return jsonify({"error": "No URL provided", "success": False}), 400
+
+    raw_input = raw_input.strip()
+
+    # Extract URL if surrounded by extra text (e.g. copied from mobile share sheet)
+    url_match = re.search(r"https?://[^\s]+", raw_input)
+    if not url_match:
+        return jsonify({"error": "No valid URL found in input", "success": False}), 400
+
+    url = url_match.group(0).rstrip(".,;)>]")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+    }
+
+    try:
+        session = requests.Session()
+        resp = session.get(url, headers=headers, allow_redirects=True, timeout=12)
+        final_url = resp.url
+        text = resp.text
+    except Exception as e:
+        print("[resolve_maps_url] Error fetching URL:", e)
+        return jsonify({"error": f"Failed to follow URL redirect: {str(e)}", "success": False, "original_url": url}), 502
+
+    name = None
+    lat = None
+    lng = None
+    photo_url = None
+    address = None
+
+    # 1. Coordinates extraction:
+    # A) Exact pin coordinates in protobuf data (!3d<lat>!4d<lng>)
+    pin_m = re.search(r"!3d(-?\d+(?:\.\d+)?)[!&/]4d(-?\d+(?:\.\d+)?)", final_url)
+    if pin_m:
+        try:
+            lat = float(pin_m.group(1))
+            lng = float(pin_m.group(2))
+        except (ValueError, TypeError):
+            pass
+
+    # B) Viewport center coordinates (@<lat>,<lng>)
+    if lat is None or lng is None:
+        view_m = re.search(r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", final_url)
+        if view_m:
+            try:
+                lat = float(view_m.group(1))
+                lng = float(view_m.group(2))
+            except (ValueError, TypeError):
+                pass
+
+    # C) Coordinates from static map image center in HTML
+    if lat is None or lng is None:
+        center_m = re.search(r"center=(-?\d+(?:\.\d+)?)(?:%2C|,)(-?\d+(?:\.\d+)?)", text)
+        if center_m:
+            try:
+                lat = float(center_m.group(1))
+                lng = float(center_m.group(2))
+            except (ValueError, TypeError):
+                pass
+
+    # D) Coordinates from query params (q=lat,lng or ll=lat,lng)
+    if lat is None or lng is None:
+        q_coords = re.search(r"[?&](?:q|ll)=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", final_url)
+        if q_coords:
+            try:
+                lat = float(q_coords.group(1))
+                lng = float(q_coords.group(2))
+            except (ValueError, TypeError):
+                pass
+
+    # 2. Place Name extraction:
+    # A) From URL path: /maps/place/<name>/
+    place_m = re.search(r"/maps/place/([^/@?]+)", final_url)
+    if place_m:
+        raw_name = place_m.group(1)
+        decoded = urllib.parse.unquote_plus(raw_name).strip()
+        if not re.match(r"^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$", decoded):
+            name = decoded
+
+    # B) From preview link query tag: href="...q=<name>"
+    if not name:
+        prev_m = re.search(r'href="[^"]*q=([^&"]+)', text)
+        if prev_m:
+            decoded = urllib.parse.unquote_plus(prev_m.group(1)).strip()
+            if not re.match(r"^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$", decoded):
+                name = decoded
+
+    # C) From URL search param query or q
+    if not name:
+        parsed_q = urllib.parse.urlparse(final_url)
+        qs = urllib.parse.parse_qs(parsed_q.query)
+        q_val = (qs.get("query") or qs.get("q") or [None])[0]
+        if q_val:
+            decoded_q = urllib.parse.unquote_plus(q_val).strip()
+            if not re.match(r"^-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?$", decoded_q):
+                name = decoded_q
+
+    # D) From HTML <title> tag
+    if not name:
+        title_m = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE)
+        if title_m:
+            t = title_m.group(1)
+            t = re.sub(r"\s*[-–]\s*Google Maps.*$", "", t, flags=re.IGNORECASE).strip()
+            if t and t.lower() != "google maps":
+                name = t
+
+    # 3. Photo extraction:
+    img_m = re.search(r'property="og:image"\s+content="([^"]+)"|content="([^"]+)"\s+property="og:image"', text)
+    if img_m:
+        photo_url = html.unescape(img_m.group(1) or img_m.group(2))
+
+    # 4. Description/Address extraction:
+    desc_m = re.search(r'property="og:description"\s+content="([^"]+)"|content="([^"]+)"\s+property="og:description"', text)
+    if desc_m:
+        desc_val = html.unescape(desc_m.group(1) or desc_m.group(2))
+        if desc_val and not desc_val.lower().startswith("find local businesses"):
+            address = desc_val
+
+    # Clean name if needed
+    clean_name = name
+    if clean_name:
+        if " · " in clean_name:
+            parts = clean_name.split(" · ")
+            clean_name = parts[0].strip()
+            if not address and len(parts) > 1:
+                address = parts[1].strip()
+
+    is_success = bool(clean_name or (lat is not None and lng is not None))
+
+    return jsonify({
+        "success": is_success,
+        "name": clean_name or (f"Accommodation ({lat:.4f}, {lng:.4f})" if lat and lng else "Selected Accommodation"),
+        "lat": lat,
+        "lng": lng,
+        "photo_url": photo_url,
+        "address": address,
+        "final_url": final_url,
+        "original_url": url
+    }), (200 if is_success else 404)
+
+
+
+import html
+
+import re
+import urllib.parse
+
+def extract_clean_user_query(raw_text: str) -> str:
+    """Extracts the actual user question if embedded in a larger system prompt."""
+    if not raw_text:
+        return ""
+    text = raw_text.strip()
+    if "User:" in text:
+        text = text.split("User:")[-1].strip()
+    elif "Human:" in text:
+        text = text.split("Human:")[-1].strip()
+    # Strip any trailing JSON or markdown blocks
+    if "```" in text:
+        text = text.split("```")[0].strip()
+    return text[:200].strip()
+
+def search_web_duckduckgo(query: str, max_results: int = 4):
+    """
+    Fetches real-time web search results from DuckDuckGo HTML Search, Instant API & Wikipedia.
+    Zero extra dependencies required.
+    """
+    clean_q = extract_clean_user_query(query)
+    if not clean_q or len(clean_q) < 2:
+        return []
+
+    results = []
+    seen_urls = set()
+
+    # 1. Query DuckDuckGo HTML Search for live organic web results
+    try:
+        ddg_html_url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        resp = requests.post(ddg_html_url, data={"q": clean_q}, headers=headers, timeout=5)
+        if resp.status_code == 200 and resp.text:
+            # Find result blocks
+            raw_snippets = re.findall(r'<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)</a>', resp.text)
+            raw_titles = re.findall(r'<a[^>]+class="result__url"[^>]*href="([^"]+)"[\s\S]*?<a[^>]+class="result__title"[^>]*>([\s\S]*?)</a>', resp.text)
+            
+            # Alternative title match
+            alt_titles = re.findall(r'<a[^>]+class="result__snippet"[^>]*href="([^"]+)"', resp.text)
+
+            for i, snip in enumerate(raw_snippets[:max_results]):
+                clean_snip = html.unescape(re.sub(r'<[^>]+>', '', snip)).strip()
+                title = clean_q
+                url = "https://duckduckgo.com"
+
+                if i < len(raw_titles):
+                    url = raw_titles[i][0]
+                    title = html.unescape(re.sub(r'<[^>]+>', '', raw_titles[i][1])).strip()
+                elif i < len(alt_titles):
+                    url = alt_titles[i]
+
+                # Decode DDG redirect URL if needed (uddg=...)
+                if "uddg=" in url:
+                    try:
+                        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+                        if "uddg" in parsed and parsed["uddg"]:
+                            url = parsed["uddg"][0]
+                    except Exception:
+                        pass
+
+                if clean_snip and url not in seen_urls:
+                    seen_urls.add(url)
+                    results.append({
+                        "title": title or clean_q,
+                        "snippet": clean_snip,
+                        "url": url
+                    })
+    except Exception as e:
+        print("[Search DDG HTML Error]", e)
+
+    # 2. If results < max_results, Query DuckDuckGo Instant API
+    if len(results) < max_results:
+        try:
+            ddg_url = "https://api.duckduckgo.com/"
+            ddg_params = {"q": clean_q, "format": "json", "no_html": "1", "skip_disambig": "1"}
+            resp = requests.get(ddg_url, params=ddg_params, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                abstract = data.get("Abstract")
+                abstract_url = data.get("AbstractURL")
+                if abstract and abstract_url not in seen_urls:
+                    seen_urls.add(abstract_url)
+                    results.append({
+                        "title": data.get("Heading") or clean_q,
+                        "snippet": abstract,
+                        "url": abstract_url or "https://duckduckgo.com"
+                    })
+                for topic in data.get("RelatedTopics", [])[:3]:
+                    if isinstance(topic, dict) and "Text" in topic and "FirstURL" in topic:
+                        t_url = topic.get("FirstURL", "")
+                        if t_url not in seen_urls:
+                            seen_urls.add(t_url)
+                            results.append({
+                                "title": topic.get("Text", "")[:50],
+                                "snippet": topic.get("Text", ""),
+                                "url": t_url
+                            })
+        except Exception as e:
+            print("[Search DDG Instant Error]", e)
+
+    # 3. Query Wikipedia API (Thai & English)
+    if len(results) < max_results:
+        try:
+            for lang in ["th", "en"]:
+                if len(results) >= max_results:
+                    break
+                wiki_url = f"https://{lang}.wikipedia.org/w/api.php"
+                wiki_headers = {"User-Agent": "PixineraryBot/1.0 (https://pixinerary.com; dev@pixinerary.com)"}
+                wiki_params = {"action": "query", "list": "search", "srsearch": clean_q, "format": "json", "utf8": "1"}
+                wresp = requests.get(wiki_url, headers=wiki_headers, params=wiki_params, timeout=5)
+                if wresp.status_code == 200:
+                    wdata = wresp.json()
+                    witems = wdata.get("query", {}).get("search", [])
+                    for item in witems[:2]:
+                        title = item.get("title", "")
+                        snippet = html.unescape(re.sub(r'<[^>]+>', '', item.get("snippet", ""))).strip()
+                        wiki_page_url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title)}"
+                        if title and snippet and wiki_page_url not in seen_urls:
+                            seen_urls.add(wiki_page_url)
+                            results.append({
+                                "title": f"{title} ({lang.upper()})",
+                                "snippet": snippet,
+                                "url": wiki_page_url
+                            })
+        except Exception as e:
+            print("[Search Wiki Error]", e)
+
+    return results[:max_results]
+
+LEGACY_MODEL_MAP = {
+    "gemini-2.5-flash": "google/gemini-2.5-flash",
+    "gemini-3.8-flash": "google/gemini-3.8-flash",
+    "google-gemini-38-flash": "google/gemini-3.8-flash",
+    "google-gemini-25-flash": "google/gemini-2.5-flash",
+    "gemini-1.5-pro": "google/gemini-2.5-flash",
+    "gpt-4o-mini": "openai/gpt-4o-mini",
+    "gpt-4o": "openai/gpt-4o",
+    "claude-sonnet": "anthropic/claude-sonnet-5",
+    "qwen-vl": "qwen/qwen2.5-vl-72b-instruct",
+    "qwen-vl-32b": "qwen/qwen2.5-vl-72b-instruct",
+    "qwen-38-flash": "qwen/qwen2.5-vl-72b-instruct",
+    "qwen3.8-flash": "qwen/qwen2.5-vl-72b-instruct",
+    "qwen/qwen3.8-flash": "qwen/qwen2.5-vl-72b-instruct",
+    "qwen-25-vl-72b": "qwen/qwen2.5-vl-72b-instruct",
+    "qwen2.5-vl-72b": "qwen/qwen2.5-vl-72b-instruct",
+    "llama4": "meta-llama/llama-3.3-70b-instruct",
+}
+
+def clean_conversational_text(text: str, user_text: str = "") -> str:
+    """
+    Cleans chatbot output according to Pix style rules:
+    - No link citations like [Pantip](https://...) unless user explicitly asks for links/sources
+    - No markdown asterisks (**bold** or *item*)
+    - Uses emojis for a clean, user-friendly reading experience
+    """
+    if not text:
+        return ""
+
+    import re
+    cleaned = text
+
+    # Check if user asked for links
+    user_asked_for_links = bool(
+        re.search(r"(ขอ|ดู|มี)?(ลิงก์|ลิ้งค์|ลิ้ง|link|url|source|ที่มา|แหล่งที่มา|แหล่งข่าว|เว็บ)", user_text, re.IGNORECASE)
+    )
+
+    if not user_asked_for_links:
+        # Remove markdown link citations like [Pantip](https://...)
+        cleaned = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', '', cleaned)
+        # Remove standalone URLs
+        cleaned = re.sub(r'https?://\S+', '', cleaned)
+
+    # Remove markdown bold/italic asterisks: **text** -> text, *text* -> text
+    cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
+    cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
+    cleaned = cleaned.replace("**", "").replace("*", "")
+
+    # Clean double spaces caused by link removal
+    cleaned = re.sub(r' +', ' ', cleaned)
+    # Clean empty lines if more than 2 consecutive
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+    return cleaned.strip()
+
+
+# --------------------
+# Benchmark Model Pricing Table (USD per 1M tokens: input, output)
+# Used as fallback accounting when OpenRouter API omits usage.cost
+# --------------------
+BENCHMARK_MODEL_PRICING = {
+    "anthropic/claude-sonnet-5": (3.00, 15.00),
+    "claude-sonnet": (3.00, 15.00),
+    "openai/gpt-5.4-mini": (0.15, 0.60),
+    "gpt-5.4-mini": (0.15, 0.60),
+    "openai/gpt-5.4": (2.50, 10.00),
+    "gpt-5.4": (2.50, 10.00),
+    "google/gemini-3.8-flash": (0.10, 0.40),
+    "gemini-3.8-flash": (0.10, 0.40),
+    "qwen/qwen2.5-vl-72b-instruct": (0.80, 1.00),
+    "qwen2.5-vl-72b": (0.80, 1.00),
+    "qwen/qwen3.8-flash": (0.80, 1.00),
+    "qwen3.8-flash": (0.80, 1.00),
+    "meta-llama/llama-4-maverick": (0.20, 0.60),
+    "llama-4-maverick": (0.20, 0.60),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gemini-2.5-flash": (0.10, 0.40),
+    "gemini-2.0-flash": (0.10, 0.40),
+    "llama-3.3-70b": (0.20, 0.60),
+}
+
+def calculate_fallback_cost(model_name: str, p_tokens: int, c_tokens: int) -> float:
+    """Calculates cost in USD based on official input/output token pricing table when API omits usage.cost."""
+    m = (model_name or "").lower()
+    in_rate, out_rate = 0.50, 1.50
+    for key, (r_in, r_out) in BENCHMARK_MODEL_PRICING.items():
+        if key in m:
+            in_rate, out_rate = r_in, r_out
+            break
+    calc = (p_tokens * in_rate + c_tokens * out_rate) / 1_000_000.0
+    return round(calc, 7)
+
+
+def optimize_base64_image(data_url: str, max_size_bytes: int = 3_500_000, max_dim: int = 1600) -> str:
+    """
+    Ensures image payload does not exceed provider size limits (e.g. Anthropic Claude 5MB limit).
+    Compresses and resizes image if necessary.
+    """
+    if not data_url or not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+        return data_url
+
+    try:
+        header, b64_str = data_url.split(",", 1)
+        raw_bytes = base64.b64decode(b64_str)
+
+        # Detect actual MIME type from magic bytes to prevent Claude/OpenRouter 400 mismatched media type errors
+        detected_mime = None
+        if raw_bytes.startswith(b'\xff\xd8\xff'):
+            detected_mime = "image/jpeg"
+        elif raw_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+            detected_mime = "image/png"
+        elif raw_bytes.startswith(b'RIFF') and len(raw_bytes) >= 12 and raw_bytes[8:12] == b'WEBP':
+            detected_mime = "image/webp"
+        elif raw_bytes.startswith(b'GIF87a') or raw_bytes.startswith(b'GIF89a'):
+            detected_mime = "image/gif"
+
+        declared_mime = header.split(";")[0].replace("data:", "").strip().lower()
+        if detected_mime and detected_mime != declared_mime:
+            print(f"[Image Optimizer] Auto-correcting mismatched MIME: declared '{declared_mime}' -> detected '{detected_mime}'")
+            header = f"data:{detected_mime}"
+            data_url = f"{header};base64,{b64_str}"
+
+        if len(raw_bytes) <= max_size_bytes:
+            return data_url  # Already small enough (and MIME is verified/fixed)
+
+        print(f"[Image Optimizer] Compressing large image: {len(raw_bytes):,} bytes (> {max_size_bytes:,} limit)")
+        img = Image.open(BytesIO(raw_bytes))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
+        # Resize if dimensions exceed max_dim
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / float(max(w, h))
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # Save with progressive JPEG compression
+        out_buf = BytesIO()
+        img.save(out_buf, format="JPEG", quality=85, optimize=True)
+        compressed_bytes = out_buf.getvalue()
+
+        # If still above limit, reduce quality further
+        if len(compressed_bytes) > max_size_bytes:
+            out_buf = BytesIO()
+            img.save(out_buf, format="JPEG", quality=70, optimize=True)
+            compressed_bytes = out_buf.getvalue()
+
+        new_b64 = base64.b64encode(compressed_bytes).decode("ascii")
+        print(f"[Image Optimizer] Successfully compressed from {len(raw_bytes):,} bytes to {len(compressed_bytes):,} bytes ({round((1 - len(compressed_bytes)/len(raw_bytes))*100, 1)}% reduction)")
+        return f"data:image/jpeg;base64,{new_b64}"
+    except Exception as opt_err:
+        print(f"[Image Optimizer Warning] Failed to compress image: {opt_err}")
+        return data_url
+
+
+@app.route("/ai", methods=["POST"])
+@app.route("/openai", methods=["POST"])
+@app.route("/gemini", methods=["POST"])
+def call_ai():
+    if not openrouter_client:
+        return jsonify({"error": "AI client / OpenRouter key not configured"}), 500
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON payload provided"}), 400
+
+    try:
+        raw_model = data.get("model", "google/gemini-2.5-flash")
+        # Resolve legacy model names if passed
+        model_name = LEGACY_MODEL_MAP.get(raw_model, raw_model)
+        expect_json = data.get("expect_json", True)
+        allow_fallback = data.get("allow_fallback", True)
+        temperature = data.get("temperature", None)
+        top_p = data.get("top_p", None)
+
+        messages = data.get("messages")
+        if not messages:
+            # Build messages from legacy Gemini format (prompt + optional image_base64)
+            prompt_text = data.get("prompt", "")
+            image_base64 = data.get("image_base64")
+            mime_type = data.get("mime_type", "image/jpeg")
+
+            if image_base64:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{image_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            else:
+                messages = [{"role": "user", "content": prompt_text}]
+
+        formatted_messages = list(messages)
+
+        # Sanitize and optimize image payloads in formatted_messages to prevent 5MB/10MB provider payload limit errors
+        for msg in formatted_messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        img_url_obj = part.get("image_url", {})
+                        raw_url = img_url_obj.get("url", "")
+                        if raw_url and raw_url.startswith("data:image/"):
+                            img_url_obj["url"] = optimize_base64_image(raw_url)
+
+        # ── Conversational ChatBot Handling with 4-Tier Real-Time Search (expect_json=False) ──
+        if not expect_json:
+            last_msg = formatted_messages[-1] if formatted_messages else {}
+            user_text = ""
+            if isinstance(last_msg.get("content"), list):
+                for item in last_msg["content"]:
+                    if item.get("type") == "text":
+                        user_text += item.get("text", "")
+            else:
+                user_text = str(last_msg.get("content", ""))
+
+            import re
+            user_asked_for_links = bool(
+                re.search(r"(ขอ|ดู|มี)?(ลิงก์|ลิ้งค์|ลิ้ง|link|url|source|ที่มา|แหล่งที่มา|แหล่งข่าว|เว็บ)", user_text, re.IGNORECASE)
+            )
+            link_rule = (
+                "- ผู้ใช้ขอลิงก์: สามารถแนบลิงก์ URL อ้างอิงที่เกี่ยวข้องได้"
+                if user_asked_for_links else
+                "- 🚫 ห้ามใส่หรือแนบลิงก์ URL อ้างอิง เช่น [ชื่อเว็บ](url) หรือ https://... ในข้อความตอบรับเด็ดขาด!"
+            )
+
+            today_str = datetime.date.today().isoformat()
+            date_anchor = (
+                f"\n[กฎเหล็กและข้อบังคับสูงสุดในการตอบสำหรับ ChatBot พิกโซ่]:\n"
+                f"- วันที่ปัจจุบันคือ {today_str} ให้ใช้ข้อมูลข่าวสารสดและเหตุการณ์ล่าสุดบนอินเทอร์เน็ตในการตอบ\n"
+                f"{link_rule}\n"
+                f"- 🚫 ห้ามใช้เครื่องหมายดอกจัน '**' หรือ '*' ในข้อความตอบรับเด็ดขาด (ห้ามทำตัวหนาด้วย ** หรือทำ bullet ด้วย *)!\n"
+                f"- ✨ ให้ปรับไปใช้อีโมจิที่เข้ากับเนื้อหา (เช่น 📍, 🚗, 🚆, 🚌, ⏱️, 💰, 💡, 🏛️, 🏮, ✨) เป็นสัญลักษณ์นำหน้าหัวข้อและหัวข้อย่อย เพื่อความ User-Friendly สบายตา น่าอ่าน และอบอุ่น"
+            )
+
+            has_system = False
+            for msg in formatted_messages:
+                if msg.get("role") == "system":
+                    msg["content"] = str(msg.get("content", "")) + date_anchor
+                    has_system = True
+                    break
+            if not has_system:
+                formatted_messages.insert(0, {"role": "system", "content": date_anchor})
+
+            # Ingest real-time news & disaster feeds from Google News RSS for destination city (Pixo Buddy parity)
+            target_city = ""
+            sys_text = ""
+            for msg in formatted_messages:
+                if msg.get("role") == "system":
+                    sys_text = str(msg.get("content", ""))
+                    break
+
+            city_match = re.search(r"จุดหมายปลายทางของทริป:\s*([^\n\r]+)", sys_text)
+            if not city_match:
+                city_match = re.search(r"Trip Destination:\s*([^\n\r]+)", sys_text)
+            if city_match:
+                target_city = city_match.group(1).strip()
+
+            if not target_city or target_city in ["Destination", "ยังไม่ได้ระบุ"]:
+                for p in ["กรุงเทพมหานคร", "กรุงเทพ", "เชียงใหม่", "ภูเก็ต", "ชลบุรี", "พัทยา", "กระบี่", "หัวหิน", "อยุธยา", "น่าน", "Tokyo", "Osaka", "Kyoto", "Seoul", "Singapore", "Bangkok"]:
+                    if p.lower() in user_text.lower():
+                        target_city = p
+                        break
+
+            if target_city and target_city not in ["Destination", "ยังไม่ได้ระบุ"]:
+                try:
+                    country_ctx = resolve_destination_context(target_city, [])
+                    disaster_news = fetch_targeted_disaster_news(target_city, country_ctx, True, datetime.date.today())
+                    if disaster_news:
+                        news_context_block = (
+                            f"\n=== รายงานข่าวสด & เหตุการณ์ฉุกเฉินล่าสุดประจำเมือง {target_city} (Google News / Real-Time Live Feeds จาก Pixo Buddy) ===\n"
+                            + "\n".join([f"- {item}" for item in disaster_news[:6]])
+                            + "\n========================================================================================\n"
+                            "- นำข้อมูลข่าวด่วนและสถานการณ์ล่าสุดนี้ไปใช้ตอบคำถามหรือให้คำแนะนำผู้ใช้อย่างถูกต้อง แม่นยำ และทันเหตุการณ์เสมอ\n"
+                        )
+                        for msg in formatted_messages:
+                            if msg.get("role") == "system":
+                                msg["content"] = str(msg.get("content", "")) + "\n" + news_context_block
+                                break
+                except Exception as news_err:
+                    print("[ChatBot Live News Ingestion Warning]:", news_err)
+
+            # 4-Tier Online Strategy (prioritize user-selected model with :online if supported):
+            candidate_online = []
+            if model_name:
+                cleaned_base = model_name.split(":")[0]
+                candidate_online.append(f"{cleaned_base}:online")
+
+            for m in [
+                "google/gemini-2.5-flash:online",
+                "google/gemini-2.0-flash-001:online",
+                "openai/gpt-4o-mini:online",
+            ]:
+                if m not in candidate_online:
+                    candidate_online.append(m)
+
+            online_models_to_try = candidate_online
+
+            cleaned_content = None
+            last_error = None
+
+            for current_model in online_models_to_try:
+                try:
+                    print(f"[ChatBot Online AI] Requesting model: {current_model}")
+                    response = openrouter_client.chat.completions.create(
+                        model=current_model,
+                        messages=formatted_messages,
+                        max_tokens=4096,
+                    )
+                    if response and getattr(response, "choices", None):
+                        choice = response.choices[0]
+                        msg = getattr(choice, "message", None)
+                        content = getattr(msg, "content", None) if msg else None
+                        if content is None and msg and hasattr(msg, "reasoning_content"):
+                            content = getattr(msg, "reasoning_content", None)
+                        if content is not None and str(content).strip():
+                            cleaned_content = str(content).strip()
+                            print(f"[ChatBot Online AI] Successfully generated reply using model: {current_model}")
+                            break
+                except Exception as online_err:
+                    print(f"[ChatBot Online AI Error on {current_model}]:", online_err)
+                    last_error = str(online_err)
+
+            # 4. Fallback if all 3 OpenRouter :online models fail
+            if not cleaned_content:
+                print("[ChatBot Online AI] All online models failed. Falling back to DuckDuckGo Search RAG.")
+                if user_text and len(user_text.strip()) > 3:
+                    search_results = search_web_duckduckgo(user_text, max_results=4)
+                    if search_results:
+                        context_blocks = []
+                        for idx, res in enumerate(search_results):
+                            context_blocks.append(f"[{idx+1}] Source: {res['url']}\nTitle: {res['title']}\nSnippet: {res['snippet']}")
+
+                        search_context = (
+                            "=== Real-Time Web Search Context (DuckDuckGo Fallback) ===\n"
+                            "Use the up-to-date web search results below to inform your response if relevant. "
+                            "Cite or refer to current details when answering questions about live events, weather, news, or places.\n"
+                            "IMPORTANT PERSONA & FORMATTING RULES:\n"
+                            "- You are 'พิกโซ่ (Pixo) - Your AI Travel Companion' — a polite, warm, smart, friendly travel buddy scout.\n"
+                            "- Always speak with polite Thai ending particles (ครับ), refer to yourself as 'ผม' or 'พิกโซ่', and STRICTLY address the user ONLY as 'คุณ' (NEVER use 'คุณลูกค้า', 'ท่าน', 'เธอ', 'นาย', 'พี่', 'น้อง', 'เพื่อน', 'ยู' or any other pronoun; ALWAYS address the user ONLY as 'คุณ').\n"
+                            "- Explain reasons clearly and concisely. Do NOT dump huge unrequested lists.\n"
+                            "- 🚫 NEVER use markdown asterisks '*' or '**' for bold or bullet points in your response. Write clean, natural prose using line breaks and tasteful emojis instead.\n"
+                            "- 🚫 DO NOT attach markdown link citations like [Site](url) unless explicitly requested.\n\n"
+                            + "\n\n".join(context_blocks) + "\n"
+                            "======================================================="
+                        )
+                        formatted_messages.insert(len(formatted_messages) - 1, {
+                            "role": "system",
+                            "content": search_context
+                        })
+
+                base_fallbacks = [
+                    model_name,
+                    "google/gemini-2.5-flash",
+                    "openai/gpt-4o-mini",
+                    "meta-llama/llama-3.3-70b-instruct"
+                ]
+                for fb_model in base_fallbacks:
+                    try:
+                        print(f"[ChatBot Fallback AI] Requesting model: {fb_model}")
+                        response = openrouter_client.chat.completions.create(
+                            model=fb_model,
+                            messages=formatted_messages,
+                            max_tokens=4096,
+                        )
+                        if response and getattr(response, "choices", None):
+                            choice = response.choices[0]
+                            msg = getattr(choice, "message", None)
+                            content = getattr(msg, "content", None) if msg else None
+                            if content is None and msg and hasattr(msg, "reasoning_content"):
+                                content = getattr(msg, "reasoning_content", None)
+                            if content is not None and str(content).strip():
+                                cleaned_content = str(content).strip()
+                                print(f"[ChatBot Fallback AI] Successfully generated reply using model: {fb_model}")
+                                break
+                    except Exception as fb_err:
+                        print(f"[ChatBot Fallback AI Error on {fb_model}]:", fb_err)
+                        last_error = str(fb_err)
+
+            if cleaned_content:
+                cleaned_content = clean_conversational_text(cleaned_content, user_text)
+                return jsonify({"text": cleaned_content})
+
+            return jsonify({"error": last_error or "AI model returned empty content"}), 500
+
+        # ── Structured JSON Generation (expect_json=True) ──
+        formatted_messages.insert(0, {
+            "role": "system",
+            "content": "You are a helpful AI assistant. You must respond ONLY with valid JSON matching the requested schema. Do not output any markdown headers, conversational text, or formatting outside of JSON."
+        })
+
+        candidate_models = [model_name]
+        if allow_fallback:
+            fallbacks = [
+                "google/gemini-2.5-flash",
+                "openai/gpt-4o-mini",
+                "openai/gpt-4o",
+                "meta-llama/llama-3.3-70b-instruct"
+            ]
+            for fb in fallbacks:
+                if fb not in candidate_models:
+                    candidate_models.append(fb)
+
+        cleaned_content = None
+        last_error = None
+        call_metrics = None
+
+        for current_model in candidate_models:
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    print(f"[AI] Requesting model: {current_model} (attempt {attempt+1}/{max_attempts}, expect_json={expect_json}, allow_fallback={allow_fallback}, temp={temperature})")
+                    max_tokens_val = int(data.get("max_tokens") or 4096)
+                    create_kwargs = {
+                        "model": current_model,
+                        "messages": formatted_messages,
+                        "max_tokens": max_tokens_val,
+                    }
+                    if temperature is not None:
+                        try:
+                            create_kwargs["temperature"] = float(temperature)
+                        except (ValueError, TypeError):
+                            pass
+                    if top_p is not None:
+                        try:
+                            create_kwargs["top_p"] = float(top_p)
+                        except (ValueError, TypeError):
+                            pass
+
+                    start_call_time = time.perf_counter()
+                    response = openrouter_client.chat.completions.create(**create_kwargs)
+                    latency_sec = time.perf_counter() - start_call_time
+
+                    if not response or not getattr(response, "choices", None):
+                        print(f"[AI] Model {current_model} returned no choices object (attempt {attempt+1})")
+                        last_error = f"AI model {current_model} returned no choices"
+                        if attempt < max_attempts - 1:
+                            time.sleep(1.5)
+                            continue
+                        break
+
+                    choice = response.choices[0]
+                    msg = getattr(choice, "message", None)
+                    content = getattr(msg, "content", None) if msg else None
+
+                    # Fallback for reasoning models (Qwen, DeepSeek, Claude) when content is None or empty string
+                    if not content and msg:
+                        content = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None) or getattr(msg, "thought", None) or getattr(msg, "text", None)
+                        if not content and hasattr(msg, "model_extra") and msg.model_extra:
+                            content = msg.model_extra.get("reasoning_content") or msg.model_extra.get("reasoning") or msg.model_extra.get("thought")
+                    if not content and hasattr(choice, "text"):
+                        content = getattr(choice, "text", None)
+
+                    if content is not None and str(content).strip():
+                        cleaned = str(content).strip()
+                        if cleaned.startswith("```"):
+                            lines = cleaned.splitlines()
+                            if lines and lines[0].startswith("```"):
+                                lines = lines[1:]
+                            if lines and lines[-1].startswith("```"):
+                                lines = lines[:-1]
+                            cleaned = "\n".join(lines).strip()
+
+                        if expect_json and not cleaned.startswith(("{", "[")):
+                            print(f"[AI] Model {current_model} non-JSON response: {cleaned[:150]}")
+                            last_error = f"AI model {current_model} declined to output valid JSON"
+                            if attempt < max_attempts - 1:
+                                time.sleep(1.5)
+                                continue
+                            break
+
+                        # Extract usage and cost metrics
+                        prompt_tokens = 0
+                        completion_tokens = 0
+                        total_tokens = 0
+                        cost_usd = 0.0
+
+                        usage_obj = getattr(response, "usage", None)
+                        if usage_obj:
+                            if hasattr(usage_obj, "model_dump"):
+                                u_dict = usage_obj.model_dump()
+                            elif isinstance(usage_obj, dict):
+                                u_dict = usage_obj
+                            else:
+                                u_dict = {}
+
+                            prompt_tokens = getattr(usage_obj, "prompt_tokens", None) or u_dict.get("prompt_tokens", 0) or 0
+                            completion_tokens = getattr(usage_obj, "completion_tokens", None) or u_dict.get("completion_tokens", 0) or 0
+                            total_tokens = getattr(usage_obj, "total_tokens", None) or u_dict.get("total_tokens", 0) or (prompt_tokens + completion_tokens)
+                            cost_usd = getattr(usage_obj, "cost", None) or u_dict.get("cost", 0.0) or 0.0
+
+                        if not cost_usd and hasattr(response, "model_dump"):
+                            try:
+                                r_dump = response.model_dump()
+                                cost_usd = r_dump.get("usage", {}).get("cost", 0.0) or 0.0
+                            except Exception:
+                                pass
+
+                        # Fallback pricing calculation if cost_usd is 0.0 or omitted by OpenRouter
+                        if (not cost_usd or float(cost_usd) <= 0.0) and (prompt_tokens > 0 or completion_tokens > 0):
+                            cost_usd = calculate_fallback_cost(current_model, prompt_tokens, completion_tokens)
+
+                        tokens_per_sec = round(completion_tokens / latency_sec, 2) if latency_sec > 0 else 0.0
+                        gen_id = getattr(response, "id", None) or ""
+                        if gen_id and OPENROUTER_API_KEY:
+                            threading.Thread(target=fetch_openrouter_generation_stats, args=(gen_id, 4, 2.5), daemon=True).start()
+
+                        call_metrics = {
+                            "prompt_tokens": int(prompt_tokens),
+                            "completion_tokens": int(completion_tokens),
+                            "total_tokens": int(total_tokens),
+                            "latency_ms": round(latency_sec * 1000, 2),
+                            "latency_sec": round(latency_sec, 3),
+                            "cost_usd": float(cost_usd),
+                            "tokens_per_sec": tokens_per_sec,
+                            "model_used": current_model,
+                            "openrouter_id": str(gen_id),
+                            "temperature": float(temperature) if temperature is not None else None,
+                            "allow_fallback": bool(allow_fallback)
+                        }
+
+                        cleaned_content = cleaned
+                        print(f"[AI] Successfully generated content using model: {current_model} (tokens: in={prompt_tokens}, out={completion_tokens}, cost=${cost_usd:.6f}, time={latency_sec:.2f}s, temp={temperature})")
+                        break
+                    else:
+                        refusal = getattr(msg, "refusal", None) if msg else None
+                        finish_reason = getattr(choice, "finish_reason", None)
+                        print(f"[AI] Model {current_model} returned empty content (finish_reason={finish_reason}, refusal={refusal}, attempt {attempt+1})")
+                        last_error = f"AI model {current_model} returned empty content"
+                        if attempt < max_attempts - 1:
+                            time.sleep(1.5)
+                            continue
+                        break
+                except Exception as model_err:
+                    err_str = str(model_err).lower()
+                    print(f"[AI] Exception calling model {current_model} (attempt {attempt+1}/{max_attempts}): {model_err}")
+                    last_error = str(model_err)
+                    is_rate_limit = any(term in err_str for term in ["429", "rate-limit", "rate limit", "temporarily", "busy", "upstream"])
+                    if is_rate_limit and attempt < max_attempts - 1:
+                        backoff = 2.0 * (attempt + 1)
+                        print(f"[AI Retry] Model {current_model} upstream rate-limited or busy. Retrying in {backoff}s...")
+                        time.sleep(backoff)
+                        continue
+                    else:
+                        break
+
+            if cleaned_content:
+                break
+
+        if cleaned_content:
+            return jsonify({
+                "text": cleaned_content,
+                "metrics": call_metrics or {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "latency_ms": 0,
+                    "latency_sec": 0,
+                    "cost_usd": 0.0,
+                    "tokens_per_sec": 0,
+                    "model_used": model_name,
+                    "openrouter_id": "",
+                    "temperature": float(temperature) if temperature is not None else None,
+                    "allow_fallback": bool(allow_fallback)
+                }
+            })
+
+        return jsonify({
+            "error": last_error or f"AI model {model_name} returned empty content or failed",
+            "model_requested": model_name
+        }), 500
+
+    except Exception as e:
+        print("AI Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/ai/generation_stats", methods=["GET"])
+def get_ai_generation_stats():
+    gen_id = request.args.get("id")
+    if not gen_id:
+        return jsonify({"error": "Missing id"}), 400
+    with generation_stats_lock:
+        stats = generation_stats_cache.get(gen_id)
+    if not stats:
+        stats = fetch_openrouter_generation_stats(gen_id, max_retries=2, initial_delay=0.6)
+    return jsonify({"stats": stats or {}})
+
+
+# --------------------
+# AI Image Generation (OpenRouter / Gemini Image API)
+# --------------------
+@app.route("/ai/generate-image", methods=["POST"])
+def generate_ai_image():
+    """
+    Generates an AI image (e.g. Infographic travel poster) using OpenRouter Image API.
+    Supports google/gemini-3-pro-image and other vision generative models.
+    """
+    api_key = OPENROUTER_API_KEY
+    if not api_key:
+        return jsonify({"error": "OpenRouter API key not configured", "success": False}), 500
+
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        return jsonify({"error": "Missing prompt parameter", "success": False}), 400
+
+    model = data.get("model", "google/gemini-3-pro-image")
+    aspect_ratio = data.get("aspect_ratio", "16:9")
+    resolution = data.get("resolution", "2K")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://vision-trip-planner.vercel.app",
+        "X-Title": "Pixinerary",
+    }
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+    }
+    if resolution:
+        payload["resolution"] = resolution
+
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/images",
+            headers=headers,
+            json=payload,
+            timeout=90
+        )
+
+        try:
+            res_data = response.json()
+        except Exception:
+            res_data = {"error": {"message": response.text}}
+
+        if response.status_code == 200:
+            items = res_data.get("data", [])
+            images = []
+            for item in items:
+                if "url" in item and item["url"]:
+                    images.append(item["url"])
+                elif "b64_json" in item and item["b64_json"]:
+                    images.append(f"data:image/png;base64,{item['b64_json']}")
+
+            return jsonify({
+                "success": True,
+                "images": images,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "raw": res_data
+            }), 200
+
+        # Handle upstream error (e.g. 402 insufficient credits, 429 rate limit)
+        err_msg = res_data.get("error", {}).get("message") or f"OpenRouter returned status {response.status_code}"
+        return jsonify({
+            "success": False,
+            "error": err_msg,
+            "status_code": response.status_code,
+            "details": res_data
+        }), response.status_code
+
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Image generation timed out (90s limit)", "success": False}), 504
+    except Exception as e:
+        print("[generate_ai_image Error]:", e)
+        return jsonify({"error": str(e), "success": False}), 500
+
+
+
+
+# In-memory cache for live transit check (5-minute TTL per query)
+_live_check_cache = {}
+
+def get_cached_live_check(cache_key: str):
+    now = time.time()
+    if cache_key in _live_check_cache:
+        entry, expiry = _live_check_cache[cache_key]
+        if now < expiry:
+            return entry
+    return None
+
+def set_cached_live_check(cache_key: str, data: dict, ttl_seconds: int = 300):
+    _live_check_cache[cache_key] = (data, time.time() + ttl_seconds)
+
+
+# In-memory cache for targeted disaster & incident news (10-minute TTL per city)
+_disaster_news_cache = {}
+
+def resolve_destination_context(city: str, places: list = None) -> dict:
+    """
+    Resolves the destination country, primary language, Google News RSS localization codes,
+    and transit ecosystem mapping for any province in Thailand or any country worldwide.
+    """
+    combined_text = f"{city or ''} {' '.join(places or [])}".lower().strip()
+
+    # 1. Japan
+    if any(k in combined_text for k in [
+        "tokyo", "โตเกียว", "kyoto", "เกียวโต", "osaka", "โอซาก้า", "sapporo", "ซัปโปโร",
+        "fukuoka", "ฟุกุโอกะ", "nagoya", "นาโกย่า", "nara", "นารา", "okinawa", "โอกินาว่า",
+        "japan", "ญี่ปุ่น", "shibuya", "shinjuku", "ginza", "akihabara", "asakusa"
+    ]):
+        return {
+            "country": "JP",
+            "country_name": "ญี่ปุ่น (Japan)",
+            "lang": "ja",
+            "gl": "JP",
+            "hl": "ja",
+            "ceid": "JP:ja",
+            "is_thailand": False,
+            "transit_apps": "GO App, Uber Taxi, JR Train, Tokyo Metro, Suica/Pasmo",
+            "query_keywords": "(地震 OR 台風 OR 大雨 OR 洪水 OR 運休 OR 警報 OR 避難 OR 停電)"
+        }
+
+    # 2. South Korea
+    if any(k in combined_text for k in [
+        "seoul", "โซล", "busan", "ปูซาน", "incheon", "อินชอน", "jeju", "เชจู",
+        "korea", "เกาหลี", "hongdae", "myeongdong", "gangnam"
+    ]):
+        return {
+            "country": "KR",
+            "country_name": "เกาหลีใต้ (South Korea)",
+            "lang": "ko",
+            "gl": "KR",
+            "hl": "ko",
+            "ceid": "KR:ko",
+            "is_thailand": False,
+            "transit_apps": "Kakao T, T-money, Seoul Metro",
+            "query_keywords": "(홍수 OR 태풍 OR 지진 OR 지하철 지연 OR 폭우 OR 경보)"
+        }
+
+    # 3. France
+    if any(k in combined_text for k in [
+        "paris", "ปารีส", "nice", "นีซ", "lyon", "ลียง", "marseille", "มาร์แซย์",
+        "france", "ฝรั่งเศส", "louvre", "eiffel"
+    ]):
+        return {
+            "country": "FR",
+            "country_name": "ฝรั่งเศส (France)",
+            "lang": "fr",
+            "gl": "FR",
+            "hl": "fr",
+            "ceid": "FR:fr",
+            "is_thailand": False,
+            "transit_apps": "RATP Metro, Citymapper, Uber, FreeNow, G7 Taxi",
+            "query_keywords": "(inondation OR grève OR alerte météo OR perturbation OR tempête OR manifestation)"
+        }
+
+    # 4. United Kingdom
+    if any(k in combined_text for k in [
+        "london", "ลอนดอน", "manchester", "แมนเชสเตอร์", "edinburgh", "เอดินบะระ",
+        "uk", "united kingdom", "อังกฤษ", "heathrow"
+    ]):
+        return {
+            "country": "GB",
+            "country_name": "สหราชอาณาจักร (UK)",
+            "lang": "en",
+            "gl": "GB",
+            "hl": "en-GB",
+            "ceid": "GB:en",
+            "is_thailand": False,
+            "transit_apps": "TfL Tube, Uber, Citymapper, Black Cab",
+            "query_keywords": "(flood OR rail strike OR tube delay OR storm warning OR road closure)"
+        }
+
+    # 5. United States
+    if any(k in combined_text for k in [
+        "new york", "นิวยอร์ก", "los angeles", "ลอสแอนเจลิส", "san francisco", "ซานฟรานซิสโก",
+        "las vegas", "ลาสเวกัส", "hawaii", "ฮาวาย", "chicago", "ชิคาโก", "usa", "america", "อเมริกา"
+    ]):
+        return {
+            "country": "US",
+            "country_name": "สหรัฐอเมริกา (USA)",
+            "lang": "en",
+            "gl": "US",
+            "hl": "en-US",
+            "ceid": "US:en",
+            "is_thailand": False,
+            "transit_apps": "Uber, Lyft, MTA Subway, Citymapper",
+            "query_keywords": "(flood warning OR flash flood OR storm alert OR subway delay OR road closure OR wildfire)"
+        }
+
+    # 6. Singapore
+    if any(k in combined_text for k in [
+        "singapore", "สิงคโปร์", "marinabay", "changi", "orchard", "sentosa"
+    ]):
+        return {
+            "country": "SG",
+            "country_name": "สิงคโปร์ (Singapore)",
+            "lang": "en",
+            "gl": "SG",
+            "hl": "en-SG",
+            "ceid": "SG:en",
+            "is_thailand": False,
+            "transit_apps": "Grab, Gojek, ComfortDelGro, MRT",
+            "query_keywords": "(flash flood OR heavy rain OR MRT breakdown OR haze OR air quality alert)"
+        }
+
+    # 7. China / Hong Kong / Taiwan
+    if any(k in combined_text for k in [
+        "hong kong", "ฮ่องกง", "taipei", "ไทเป", "taiwan", "ไต้หวัน",
+        "beijing", "ปักกิ่ง", "shanghai", "เซี่ยงไฮ้", "guangzhou", "กวางโจว", "china", "จีน"
+    ]):
+        is_hk = "hong kong" in combined_text or "ฮ่องกง" in combined_text
+        is_tw = "taiwan" in combined_text or "ไต้หวัน" in combined_text or "taipei" in combined_text or "ไทเป" in combined_text
+        return {
+            "country": "HK" if is_hk else ("TW" if is_tw else "CN"),
+            "country_name": "จีน / ฮ่องกง / ไต้หวัน",
+            "lang": "zh",
+            "gl": "HK" if is_hk else ("TW" if is_tw else "CN"),
+            "hl": "zh-TW" if (is_tw or is_hk) else "zh-CN",
+            "ceid": "HK:zh-Hant" if is_hk else ("TW:zh-Hant" if is_tw else "CN:zh-Hans"),
+            "is_thailand": False,
+            "transit_apps": "Didi, MTR, MRT, WeChat Pay / Alipay",
+            "query_keywords": "(暴雨 OR 洪水 OR 颱風 OR 地震 OR 停運 OR 警報)"
+        }
+
+    # 8. Vietnam
+    if any(k in combined_text for k in [
+        "vietnam", "เวียดนาม", "hanoi", "ฮานอย", "ho chi minh", "โฮจิมินห์", "da nang", "ดานัง"
+    ]):
+        return {
+            "country": "VN",
+            "country_name": "เวียดนาม (Vietnam)",
+            "lang": "vi",
+            "gl": "VN",
+            "hl": "vi",
+            "ceid": "VN:vi",
+            "is_thailand": False,
+            "transit_apps": "Grab, Be, Gojek, Mai Linh Taxi",
+            "query_keywords": "(ngập lụt OR bão OR sạt lở OR kẹt xe OR cảnh báo mưa lớn)"
+        }
+
+    # 9. Thailand (Default for Thai provinces / script or empty city)
+    is_thai_script = bool(re.search(r'[\u0e00-\u0e7f]', combined_text))
+    thai_province_match = any(p in combined_text for p in [
+        "bangkok", "กรุงเทพ", "chiang mai", "เชียงใหม่", "phuket", "ภูเก็ต", "krabi", "กระบี่",
+        "pattaya", "พัทยา", "chonburi", "ชลบุรี", "samui", "สมุย", "surat thani", "สุราษฎร์",
+        "hua hin", "หัวหิน", "ayutthaya", "อยุธยา", "chiang rai", "เชียงราย", "nan", "น่าน",
+        "kanchanaburi", "กาญจนบุรี", "khon kaen", "ขอนแก่น", "udon", "อุดร", "hat yai", "หาดใหญ่",
+        "songkhla", "สงขลา", "korat", "โคราช", "nakhon", "นคร", "ubon", "อุบล", "rayong", "ระยอง"
+    ])
+
+    if is_thai_script or thai_province_match or not city:
+        return {
+            "country": "TH",
+            "country_name": "ไทย (Thailand)",
+            "lang": "th",
+            "gl": "TH",
+            "hl": "th",
+            "ceid": "TH:th",
+            "is_thailand": True,
+            "transit_apps": "BTS, MRT, SRT, ARL, เรือโดยสาร, Grab, Bolt, LINE MAN",
+            "query_keywords": "(น้ำท่วม OR น้ำรอระบาย OR น้ำท่วมขัง OR ดินสไลด์ OR ดินถล่ม OR ปิดถนน OR รถไฟฟ้าขัดข้อง OR พายุ OR แผ่นดินไหว OR เตือนภัย)"
+        }
+
+    # 10. Global Default
+    return {
+        "country": "GLOBAL",
+        "country_name": city or "Global Destination",
+        "lang": "en",
+        "gl": "US",
+        "hl": "en-US",
+        "ceid": "US:en",
+        "is_thailand": False,
+        "transit_apps": "Local Transit, Uber, Ride-hailing Apps",
+        "query_keywords": "(flood OR flash flood OR storm warning OR earthquake OR transit strike OR road closure OR wildfire OR emergency)"
+    }
+
+
+def fetch_targeted_disaster_news(target_city: str, country_context: dict, is_today: bool, target_date: datetime.date) -> list:
+    """
+    Deterministic Multi-Source Real-Time News & Disaster Ingestion.
+    Queries Google News RSS in the country's local language for breaking natural disasters,
+    floods, storms, transit strikes, and emergency warnings in under 500ms.
+    Caches results per city for 10 minutes (600s TTL).
+    """
+    clean_city = target_city.strip() if target_city else "กรุงเทพมหานคร"
+    cache_key = f"{clean_city}_{country_context.get('country', 'TH')}".lower()
+    now = time.time()
+
+    if cache_key in _disaster_news_cache:
+        entry, expiry = _disaster_news_cache[cache_key]
+        if now < expiry:
+            return entry
+
+    news_items = []
+
+    # 1. Google News RSS Retrieval
+    try:
+        keywords = country_context.get("query_keywords", "(flood OR storm OR emergency)")
+        gl = country_context.get("gl", "TH")
+        hl = country_context.get("hl", "th")
+        ceid = country_context.get("ceid", "TH:th")
+
+        search_query = f"{clean_city} {keywords} when:2d"
+        encoded_q = urllib.parse.quote(search_query)
+        rss_url = f"https://news.google.com/rss/search?q={encoded_q}&hl={hl}&gl={gl}&ceid={ceid}"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8"
+        }
+
+        resp = requests.get(rss_url, headers=headers, timeout=3.5)
+        if resp.status_code == 200 and resp.content:
+            root = ET.fromstring(resp.content)
+            items = root.findall('./channel/item')
+            for item in items[:6]:
+                title_elem = item.find('title')
+                source_elem = item.find('source')
+                pubdate_elem = item.find('pubDate')
+
+                raw_title = title_elem.text.strip() if title_elem is not None and title_elem.text else ""
+                source_name = source_elem.text.strip() if source_elem is not None and source_elem.text else ""
+
+                if raw_title:
+                    clean_title = raw_title
+                    if " - " in clean_title:
+                        clean_title = clean_title.rsplit(" - ", 1)[0].strip()
+
+                    source_label = f"[{source_name}] " if source_name else ""
+                    news_items.append(f"{source_label}{clean_title}")
+    except Exception as rss_err:
+        print(f"[News RSS Ingestion Warning for {clean_city}]:", rss_err)
+
+    # 2. Fallback to DuckDuckGo search if RSS returned empty
+    if len(news_items) < 2:
+        try:
+            ddg_query = f"{clean_city} น้ำท่วม รถติด ข่าวด่วน" if country_context.get("is_thailand") else f"{clean_city} flood storm weather warning news"
+            ddg_res = search_web_duckduckgo(ddg_query, max_results=3)
+            for r in ddg_res:
+                snip = r.get("snippet", "").strip()
+                t = r.get("title", "").strip()
+                if snip or t:
+                    news_items.append(f"[{t}]: {snip[:160]}" if snip else t)
+        except Exception as ddg_err:
+            print(f"[News DDG Fallback Warning for {clean_city}]:", ddg_err)
+
+    # Cache for 10 minutes (600s)
+    _disaster_news_cache[cache_key] = (news_items, now + 600)
+    return news_items
+
+
+UNIVERSAL_SEASONAL_RULES = [
+    {
+        "name": "ตรุษจีน (Chinese New Year)",
+        "keywords": ["ตรุษจีน", "chinese new year", "spring festival", "วันตรุษจีน"],
+        "valid_months": [1, 2],
+        "substitutes": [
+            ("ช่วงเทศกาลตรุษจีน", "ช่วงเวลาปกติ"),
+            ("ช่วงตรุษจีน", "ช่วงเย็น"),
+            ("เทศกาลตรุษจีน", "ย่านการค้าและวัฒนธรรม"),
+            ("บรรยากาศตรุษจีน", "บรรยากาศสตรีทฟู้ด"),
+            ("งานตรุษจีน", "แหล่งรวมสตรีทฟู้ด"),
+            ("ตรุษจีน", "เยาวราช"),
+            ("Chinese New Year", "Chinatown"),
+        ]
+    },
+    {
+        "name": "สงกรานต์ (Songkran)",
+        "keywords": ["สงกรานต์", "songkran", "สาดน้ำ", "ปีใหม่ไทย"],
+        "valid_months": [4],
+        "substitutes": [
+            ("ช่วงเทศกาลสงกรานต์", "ช่วงเวลาปกติ"),
+            ("เทศกาลสงกรานต์", "แหล่งท่องเที่ยวยอดนิยม"),
+            ("เล่นน้ำสงกรานต์", "ท่องเที่ยวทั่วไป"),
+            ("สงกรานต์", "เมืองเก่า"),
+            ("Songkran", "Old Town"),
+        ]
+    },
+    {
+        "name": "เทศกาลกินเจ (Vegetarian Festival)",
+        "keywords": ["กินเจ", "เทศกาลกินเจ", "vegetarian festival", "ถือศีลกินผัก"],
+        "valid_months": [9, 10],
+        "substitutes": [
+            ("เทศกาลกินเจ", "แหล่งอาหารสตรีทฟู้ด"),
+            ("กินเจ", "อาหารทั่วไป"),
+        ]
+    },
+    {
+        "name": "ลอยกระทง (Loy Krathong)",
+        "keywords": ["ลอยกระทง", "loy krathong", "วันลอยกระทง", "ยี่เป็ง", "yi peng"],
+        "valid_months": [11],
+        "substitutes": [
+            ("เทศกาลลอยกระทง", "จุดชมวิวริมแม่น้ำ"),
+            ("ลอยกระทง", "ริมแม่น้ำ"),
+            ("Loy Krathong", "Riverside"),
+        ]
+    },
+    {
+        "name": "ฤดูหนาว & ดอกไม้เมืองหนาว",
+        "keywords": ["นางพญาเสือโคร่ง", "ซากุระเมืองไทย", "ดอกบัวตอง", "ทะเลหมอกหนาวจัด"],
+        "valid_months": [11, 12, 1],
+        "substitutes": [
+            ("ดอกนางพญาเสือโคร่งบาน", "ธรรมชาติขุนเขา"),
+            ("อากาศหนาวจัด", "สภาพอากาศบนดอย"),
+        ]
+    },
+    {
+        "name": "มรสุมปิดเกาะอุทยานแห่งชาติทางทะเล (Andaman Sea Closures)",
+        "keywords": ["ปิดเกาะสิมิลัน", "ปิดเกาะสุรินทร์", "มรสุมอันดามัน"],
+        "valid_months": [5, 6, 7, 8, 9, 10],
+        "substitutes": []
+    }
+]
+
+
+def build_buddy_search_query(target_term: str, places: list, target_date: datetime.date, is_today: bool) -> str:
+    thai_months = [
+        "", "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+        "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"
+    ]
+    month_name = thai_months[target_date.month] if 1 <= target_date.month <= 12 else ""
+    year_be = target_date.year + 543
+    places_subset = " ".join([p.strip() for p in places[:3] if p.strip()]) if places else target_term
+
+    if is_today:
+        return f"{target_term} {places_subset} สภาพการจราจร รถไฟฟ้า รถติด น้ำท่วม ข่าวด่วนวันนี้ {target_date.day} {month_name} {year_be}"
+    else:
+        return f"{target_term} {places_subset} ประกาศปิดปรับปรุง ซ่อมแซม ตารางเวลา {month_name} {year_be}"
+
+
+def strip_raw_markdown_noise(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    # 1. Convert markdown link [text](url) -> text
+    text = re.sub(r'\[([^\]]+)\]\((?:https?://[^\)]+|[^\)]+)\)', r'\1', text)
+    # 2. Strip bracketed domain citations or lists like [lemon8-app.com], [a.com, b.com], [th.trip.com]
+    text = re.sub(r'\[[^\]]*\.[a-zA-Z]{2,}[^\]]*\]', '', text)
+    # 3. Strip raw URLs (http://... or https://...)
+    text = re.sub(r'https?://[^\s\)\]]+', '', text)
+    # 4. Clean empty parentheses or brackets left behind like () or []
+    text = re.sub(r'\(\s*\)', '', text)
+    text = re.sub(r'\[\s*\]', '', text)
+    # 5. Clean excessive spaces
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
+
+def sanitize_buddy_live_data(live_data: dict, target_date: datetime.date, is_today: bool, target_term: str) -> dict:
+    """
+    Universal Deterministic Post-Processing Guardrail:
+    1. Enforces Universal Seasonal Matrix across all nationwide festivals.
+    2. Disaster Alert preservation, severity scoring, and markdown stripping.
+    3. Implements Event vs Advance Notice Scoping:
+       - Transient breaking incidents (e.g. today short circuits, today sudden storms) are purged for future dates.
+       - Legitimate scheduled maintenance or ongoing multi-day disasters (floods) spanning target date are preserved.
+    4. Enriches advice with multi-modal rapid transit and ride-hailing options.
+    5. Strips raw markdown link noise and domain citations from text fields for clean, glanceable display.
+    """
+    month_num = target_date.month
+
+    # 0. Disaster & Hazard Alert Preservation & Guardrail
+    disaster_alert = live_data.get("disaster_alert")
+    if isinstance(disaster_alert, dict) and disaster_alert.get("has_disaster"):
+        sev = disaster_alert.get("severity", "warning")
+        if sev in ["critical", "warning"]:
+            live_data["has_disruption"] = True
+            live_data["notice_type"] = "disaster_alert"
+            if sev == "critical":
+                live_data["transit_status"] = "critical"
+            elif live_data.get("transit_status") == "normal":
+                live_data["transit_status"] = "warning"
+        if disaster_alert.get("headline"):
+            disaster_alert["headline"] = strip_raw_markdown_noise(disaster_alert["headline"])
+        if disaster_alert.get("action_advice"):
+            disaster_alert["action_advice"] = strip_raw_markdown_noise(disaster_alert["action_advice"])
+
+    # 1. Universal Seasonal Matrix Enforcement
+    for rule in UNIVERSAL_SEASONAL_RULES:
+        if month_num not in rule["valid_months"]:
+            filtered_events = []
+            for evt in live_data.get("special_events", []):
+                if isinstance(evt, dict):
+                    name = (evt.get("event_name") or "").lower()
+                    hl = (evt.get("highlight") or "").lower()
+                    loc = (evt.get("location") or "").lower()
+                    if any(kw in name or kw in hl or kw in loc for kw in rule["keywords"]):
+                        continue
+                filtered_events.append(evt)
+            live_data["special_events"] = filtered_events
+
+            for old_s, new_s in rule["substitutes"]:
+                for key in ["title", "summary", "weather_traffic_alert", "advice_for_travelers", "local_tips_and_rules"]:
+                    val = live_data.get(key)
+                    if isinstance(val, str) and old_s in val:
+                        live_data[key] = val.replace(old_s, new_s)
+
+    # 2. Advance Scoping & Event Classification Guard:
+    if not is_today:
+        transient_keywords = [
+            "ไฟฟ้าลัดวงจร", "ขัดข้องเมื่อ", "หยุดให้บริการชั่วคราว", "หยุดให้บริการบางส่วน",
+            "เมื่อวานนี้", "วันนี้", "เช้านี้", "บ่ายนี้", "สักครู่", "กะทันหัน", "สดวันนี้"
+        ]
+        disruptions = live_data.get("disruptions", [])
+        has_real_scheduled_disruption = False
+        for d in disruptions:
+            if isinstance(d, dict):
+                detail = d.get("detail", "")
+                if any(kw in detail for kw in transient_keywords):
+                    d["status"] = "normal"
+                    d["detail"] = "ให้บริการตามปกติ (ตรวจสอบตารางเดินรถตามช่วงเวลา)"
+                if d.get("status") in ["disrupted", "delayed"]:
+                    has_real_scheduled_disruption = True
+
+        attractions = live_data.get("attraction_alerts", [])
+        has_real_scheduled_attraction_closure = False
+        for a in attractions:
+            if isinstance(a, dict):
+                note = a.get("note", "")
+                status = a.get("status", "normal")
+                if any(kw in note for kw in ["วันนี้", "บ่ายนี้", "เช้านี้", "ชั่วคราว 1 ชั่วโมง"]):
+                    if not any(lt in note for lt in ["ถึงวันที่", "ระหว่างวันที่", "บูรณะ", "ซ่อมแซมใหญ่", "ปิดปรับปรุง"]):
+                        a["status"] = "normal"
+                        a["note"] = "เปิดทำการตามปกติ"
+                if a.get("status") in ["closed", "restricted"]:
+                    has_real_scheduled_attraction_closure = True
+
+        # Check if there is an active ongoing multi-day disaster
+        has_active_disaster = bool(disaster_alert and isinstance(disaster_alert, dict) and disaster_alert.get("has_disaster") and disaster_alert.get("severity") in ["critical", "warning"])
+
+        if not has_real_scheduled_disruption and not has_real_scheduled_attraction_closure and not has_active_disaster:
+            live_data["has_disruption"] = False
+            live_data["transit_status"] = "normal"
+            live_data["notice_type"] = "regular_advisory"
+            title = live_data.get("title", "")
+            if any(w in title for w in ["หยุดให้บริการ", "ขัดข้อง", "ไฟฟ้าลัดวงจร", "เตือนด่วน", "สดวันนี้"]):
+                live_data["title"] = f"แนะนำการเดินทางและระบบขนส่ง {target_term}"
+        elif has_active_disaster:
+            live_data["has_disruption"] = True
+            live_data["notice_type"] = "disaster_alert"
+        else:
+            live_data["has_disruption"] = True
+            live_data["notice_type"] = "scheduled_maintenance"
+    else:
+        # Today
+        if live_data.get("has_disruption"):
+            if disaster_alert and isinstance(disaster_alert, dict) and disaster_alert.get("has_disaster"):
+                live_data["notice_type"] = "disaster_alert"
+            else:
+                live_data["notice_type"] = "live_incident"
+        else:
+            live_data["notice_type"] = "regular_advisory"
+
+    # 3. Ride-hailing suggestion enrichment
+    adv = live_data.get("advice_for_travelers", "")
+    if adv and not any(rh in adv.lower() for rh in ["grab", "bolt", "line man", "uber", "go app", "เรียกรถ", "แอป"]):
+        live_data["advice_for_travelers"] = adv.rstrip(" .") + " | หากการจราจรติดขัดหรือไม่มีรถไฟฟ้าผ่านโดยตรง แนะนำเรียกแอปเรียกรถเพื่อความสะดวกรวดเร็วครับ"
+
+    # 4. Clean raw markdown noise, URLs, and citations from text fields
+    for field in ["title", "summary", "weather_traffic_alert", "advice_for_travelers", "local_tips_and_rules"]:
+        val = live_data.get(field)
+        if isinstance(val, str):
+            live_data[field] = strip_raw_markdown_noise(val)
+
+    for d in live_data.get("disruptions", []):
+        if isinstance(d, dict):
+            if "detail" in d:
+                d["detail"] = strip_raw_markdown_noise(d["detail"])
+            if "line" in d:
+                d["line"] = strip_raw_markdown_noise(d["line"])
+
+    for a in live_data.get("attraction_alerts", []):
+        if isinstance(a, dict):
+            if "note" in a:
+                a["note"] = strip_raw_markdown_noise(a["note"])
+            if "place_name" in a:
+                a["place_name"] = strip_raw_markdown_noise(a["place_name"])
+
+    for e in live_data.get("special_events", []):
+        if isinstance(e, dict):
+            for k in ["eventName", "event_name", "highlight", "location"]:
+                if k in e and isinstance(e[k], str):
+                    e[k] = strip_raw_markdown_noise(e[k])
+
+    return live_data
+
+
+@app.route("/ai/buddy-live-check", methods=["POST"])
+def buddy_live_check():
+    """
+    Universal Hybrid Disaster & News Intelligence for Pixo Travel Buddy.
+    Combines Deterministic Multi-Source News Ingestion (Google News RSS / GDACS / DDG)
+    with Context-Enriched LLM Disaster Synthesis via OpenRouter Cascade (Gemini 2.5 Flash -> Gemini 2.0 Flash -> GPT-4o Mini).
+    Supports all situations (Floods, Storms, Earthquakes, Strikes, PM2.5, Protests),
+    77 provinces of Thailand, and worldwide destinations.
+    """
+    try:
+        data = request.get_json(silent=True)
+        if not data:
+            try:
+                raw_body = request.get_data(as_text=True)
+                data = json.loads(raw_body) if raw_body else {}
+            except Exception:
+                data = {}
+
+        city = (data.get("city") or "").strip()
+        places = data.get("places") or []
+        date_str = data.get("date") or datetime.date.today().isoformat()
+
+        today_date = datetime.date.today()
+        target_date = today_date
+        try:
+            if date_str:
+                clean_date_str = str(date_str).split("T")[0]
+                target_date = datetime.date.fromisoformat(clean_date_str)
+        except Exception:
+            target_date = today_date
+
+        is_today = (target_date == today_date)
+        is_future = (target_date > today_date)
+
+        target_term = city or (places[0] if places else "กรุงเทพมหานคร")
+        places_slug = "_".join(sorted([p.strip().lower() for p in places[:5]])) if places else "general"
+        cache_key = f"{target_term}_{target_date.isoformat()}_{places_slug}".lower()
+        cached = get_cached_live_check(cache_key)
+        if cached:
+            return jsonify(cached)
+
+        if not city and not places:
+            return jsonify({
+                "status": "empty",
+                "has_disruption": False,
+                "transit_status": "normal",
+                "notice_type": "regular_advisory",
+                "title": "ไม่มีข้อมูลสถานที่",
+                "summary": "ไม่พบข้อมูลเมืองหรือสถานที่สำหรับตรวจสอบเหตุการณ์สด",
+                "disruptions": [],
+                "attraction_alerts": [],
+                "special_events": [],
+                "weather_traffic_alert": "",
+                "advice_for_travelers": "",
+                "local_tips_and_rules": "",
+                "disaster_alert": {"has_disaster": False, "disaster_type": "none", "severity": "none", "headline": "", "affected_areas": [], "action_advice": ""},
+                "tips": [],
+                "live_updates": [],
+                "sources": [],
+                "sources_count": 0
+            })
+
+        # 1. Geo & Country Context Resolution
+        country_ctx = resolve_destination_context(target_term, places)
+        is_thailand = country_ctx.get("is_thailand", True)
+
+        # 2. Ingest Verified Real-Time Disaster & Emergency News (< 400ms)
+        disaster_news_items = fetch_targeted_disaster_news(target_term, country_ctx, is_today, target_date)
+        if disaster_news_items:
+            news_context_block = (
+                "\n=== รายงานข่าวสด & เหตุฉุกเฉิน/ภัยพิบัติล่าสุดจากสื่อท้องถิ่น (Real-Time Verified Local Feeds) ===\n"
+                + "\n".join([f"- {item}" for item in disaster_news_items[:6]])
+                + "\n========================================================================\n"
+            )
+        else:
+            news_context_block = "\n(ไม่พบรายงานข่าวด่วนหรือภัยพิบัติรุนแรงจากสื่อท้องถิ่นในขณะนี้)\n"
+
+        thai_months = [
+            "", "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+            "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"
+        ]
+        thai_days = ["วันจันทร์", "วันอังคาร", "วันพุธ", "วันพฤหัสบดี", "วันศุกร์", "วันเสาร์", "วันอาทิตย์"]
+        day_of_week_str = thai_days[target_date.weekday()]
+        thai_month_str = thai_months[target_date.month] if 1 <= target_date.month <= 12 else ""
+        thai_year_be = target_date.year + 543
+        month_num = target_date.month
+
+        date_description = (
+            f"{target_date.isoformat()} ({day_of_week_str} ที่ {target_date.day} {thai_month_str} พ.ศ. {thai_year_be})"
+            if is_thailand else
+            f"{target_date.isoformat()} ({target_date.strftime('%A, %B %d, %Y')} - {country_ctx['country_name']})"
+        )
+        day_mode = "วันนี้ (เหตุการณ์สดจริงหน้างาน Real-time Live)" if is_today else f"วันข้างหน้าในแผนเดินทาง ({date_description} - เน้นคำแนะนำการวางแผนล่วงหน้า)"
+        places_text = ', '.join(places[:6]) if places else target_term
+
+        if is_today:
+            temporal_scope_instruction = "[สำหรับวันปัจจุบัน]: รายงานเหตุฉุกเฉิน/ขัดข้องสดจริงในวันนี้เท่านั้น"
+        else:
+            temporal_scope_instruction = (
+                f"[สำหรับวันข้างหน้า ({date_description})]:\n"
+                "      * ห้ามนำเหตุด่วนฉุกเฉินชั่วคราวสั้นๆ ของวันนี้ (เช่น รถไฟฟ้าขัดข้อง 1 ชม. วันนี้ หรืออุบัติเหตุรถชนวันนี้) ไปแจ้งเตือนวันข้างหน้า\n"
+                '      * ยกเว้นกรณีภัยพิบัติรุนแรงต่อเนื่องหลายวัน (เช่น น้ำท่วมขังเรื้อรัง, มรสุมปิดเกาะ) หรือการปิดซ่อมบำรุงระยะยาว ให้คงการแจ้งเตือนไว้และตั้ง notice_type: "scheduled_maintenance" หรือ "disaster_alert"'
+            )
+
+        if is_thailand:
+            festival_instruction = (
+                "กฎเทศกาลไทย: ตรุษจีนเฉพาะเดือน 1-2, สงกรานต์เฉพาะเดือน 4, กินเจปลายเดือน 9-10, "
+                "ลอยกระทงเดือน 11 หากวันที่ระบุไม่มีเทศกาลใหญ่ให้ special_events เป็น []"
+            )
+        else:
+            festival_instruction = (
+                f"สำหรับ {country_ctx['country_name']}: ไม่ต้องใช้กฎเทศกาลไทย "
+                "ให้ยึดตามเทศกาลหรือวันหยุดสากลที่ตรงกับวันดังกล่าวจริง"
+            )
+
+        # 3. Primary: OpenRouter with live web search & disaster synthesis
+        if openrouter_client:
+            prompt = f"""คุณคือระบบตรวจสอบข้อมูลสด ภัยพิบัติ และการเดินทางอัจฉริยะ (Pixo Universal Live Disaster & Transit Companion) ประจำเมือง {target_term} ({country_ctx['country_name']})
+วันที่ของทริปนี้: {date_description}
+ประเภทวัน: {day_mode}
+สถานที่ในทริปของวันดังกล่าว: {places_text}
+ระบบขนส่งและแอปแนะนำในพื้นที่นี้: {country_ctx['transit_apps']}
+
+{news_context_block}
+
+กรุณาวิเคราะห์ข้อมูลจากข่าวสดด้านบนร่วมกับการตรวจสอบแบบ Fact-Checked เพื่อความปลอดภัยสูงสุดของผู้เดินทาง:
+
+1. [ตรวจสอบภัยพิบัติและเหตุฉุกเฉิน (DISASTER & SAFETY EVALUATION) - สำคัญสูงสุด]:
+   - ตรวจสอบว่าในเมือง {target_term} หรือสถานที่ {places_text} กำลังเผชิญเหตุการณ์เหล่านี้หรือไม่:
+     * น้ำท่วม, น้ำรอระบาย, น้ำท่วมขังบนถนน (Floods / Urban Waterlogging / Flash Floods)
+     * พายุ, ไต้ฝุ่น, ฝนตกหนักถึงหนักมาก (Severe Storm / Typhoon / Torrential Rain)
+     * แผ่นดินไหว, สึนามิ, ดินโคลนถล่ม (Earthquake / Tsunami / Landslide)
+     * รถไฟฟ้า/รถไฟใต้ดินหยุดวิ่ง, ขนส่งหยุดให้บริการ, การนัดหยุดงานประท้วง (Train Suspension / Strike)
+     * ค่าฝุ่น PM2.5 วิกฤต, คลื่นความร้อนจัด (Hazardous PM2.5 / Extreme Heatwave)
+     * การชุมนุมประท้วงปิดถนน, ประกาศเคอร์ฟิว (Civil Protests / Road Closures)
+   - หากมีภัยพิบัติ/เหตุฉุกเฉินจริง:
+     * ตั้ง "has_disruption": true
+     * ตั้ง "notice_type": "disaster_alert"
+     * ตั้ง "transit_status": "critical" (หากรุนแรง/น้ำท่วมสูง/ปิดเส้นทาง) หรือ "warning" (หากระดับปานกลาง/รอระบาย)
+     * ใส่ข้อมูลใน "disaster_alert" ให้ครบถ้วน: has_disaster: true, disaster_type, severity, headline (สั้นกระชับไม่เกิน 10 คำ), affected_areas (ระบุถนนหรือย่านที่ได้รับผลกระทบ), action_advice (คำแนะนำสั้นๆ เช่น ให้เลี่ยงถนน ใช้รถไฟฟ้า หรือสลับแผน)
+   - หากไม่มีภัยพิบัติ:
+     * ตั้ง "disaster_alert": {{"has_disaster": false, "disaster_type": "none", "severity": "none", "headline": "", "affected_areas": [], "action_advice": ""}}
+
+2. [การจำแนกประเภทเหตุการณ์และความเกี่ยวข้องกับวัน (Temporal Scoping)]:
+   - {temporal_scope_instruction}
+
+3. [การปรับให้เข้ากับประเทศและวัฒนธรรม (Localization & Transit)]:
+   - {festival_instruction}
+   - แนะนำระบบคมนาคมและแอปเรียกรถที่ใช้งานได้จริงในพื้นที่นี้ ({country_ctx['transit_apps']})
+
+4. [สถานะสถานที่ท่องเที่ยวในทริป]:
+   - ตรวจสอบว่าสถานที่ {places_text} มีจุดใดปิดปรับปรุง ปิดซ่อมแซม หรือได้รับผลกระทบจากภัยพิบัติหรือไม่
+
+ตอบกลับเป็น JSON เท่านั้น (Strict JSON) สรุปฉับไวกระชับ **ห้ามใส่ URL หรือลิงก์ในเนื้อหาข้อความเด็ดขาด** (ให้ใส่ URL เฉพาะในฟิลด์ sources เท่านั้น):
+{{
+  "has_disruption": true หรือ false,
+  "notice_type": "disaster_alert" | "live_incident" | "scheduled_maintenance" | "regular_advisory",
+  "transit_status": "normal" | "warning" | "critical",
+  "disaster_alert": {{
+    "has_disaster": true หรือ false,
+    "disaster_type": "flood" | "storm" | "earthquake" | "transit_strike" | "air_quality" | "protest" | "general_disaster" | "none",
+    "severity": "critical" | "warning" | "info" | "none",
+    "headline": "หัวข้อเตือนภัยสั้นๆ เช่น เตือนภัยน้ำท่วมขังรอการระบายหลายพื้นที่ หรือ ปล่อยว่างถ้าไม่มี",
+    "affected_areas": ["ชื่อย่านหรือถนนที่ได้รับผลกระทบ"],
+    "action_advice": "คำแนะนำสั้นๆ 1 ประโยค เช่น เลี่ยงการใช้ถนน ใช้ BTS/MRT แทน"
+  }},
+  "title": "หัวข้อสรุปฉับไวสั้นๆ ไม่เกิน 8-10 คำ",
+  "summary": "สรุปภาพรวมแบบฉับไว 1 ประโยคสั้นๆ ตรงประเด็น (ห้ามมี URL)",
+  "disruptions": [
+    {{
+      "line": "ชื่อสายรถไฟฟ้าหรือเส้นทาง",
+      "status": "normal" | "delayed" | "disrupted",
+      "detail": "รายละเอียดสั้นกระชับ 1 บรรทัด"
+    }}
+  ],
+  "attraction_alerts": [
+    {{
+      "place_name": "ชื่อสถานที่",
+      "status": "closed" | "restricted" | "crowded" | "normal",
+      "note": "รายละเอียดสั้นๆ"
+    }}
+  ],
+  "special_events": [
+    {{
+      "event_name": "ชื่องานเทศกาลที่ตรงกับเดือนดังกล่าวจริง (ถ้าไม่มีให้ปล่อยว่าง)",
+      "location": "สถานที่จัดงาน",
+      "highlight": "จุดเด่นสั้นๆ 1 บรรทัด"
+    }}
+  ],
+  "weather_traffic_alert": "สภาพอากาศหรือการจราจรฉับไว 1 ประโยค",
+  "advice_for_travelers": "คำแนะนำการเดินทางสั้นๆ 1-2 ประโยค (ระบุแอปหรือวิธีเดินทางที่เหมาะสม)",
+  "local_tips_and_rules": "ข้อควรระวังหรือคำแนะนำสำคัญสั้นๆ 1-2 ข้อ (ห้ามใส่ URL)",
+  "sources": ["ชื่อแหล่งข่าวหรือสำนักข่าว"]
+}}
+"""
+            models_to_try = [
+                "google/gemini-2.5-flash:online",
+                "google/gemini-2.0-flash-001:online",
+                "openai/gpt-4o-mini:online",
+            ]
+            live_data = None
+            used_model = None
+
+            for current_model in models_to_try:
+                try:
+                    resp = openrouter_client.chat.completions.create(
+                        model=current_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=2048,
+                    )
+                    content = (resp.choices[0].message.content or "").strip()
+                    if content.startswith("```"):
+                        lines = content.splitlines()
+                        if lines and lines[0].startswith("```"):
+                            lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        content = "\n".join(lines).strip()
+
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and "has_disruption" in parsed:
+                        live_data = parsed
+                        used_model = current_model
+                        break
+                except Exception as model_err:
+                    print(f"[OpenRouter Live Check Error on {current_model}]:", model_err)
+
+            if live_data:
+                live_data = sanitize_buddy_live_data(live_data, target_date, is_today, target_term)
+
+                live_updates = []
+                tips = []
+                if live_data.get("summary"):
+                    live_updates.append(live_data["summary"])
+                    tips.append(live_data["summary"])
+                if live_data.get("advice_for_travelers"):
+                    tips.append(live_data["advice_for_travelers"])
+                if live_data.get("local_tips_and_rules"):
+                    tips.append(live_data["local_tips_and_rules"])
+                if live_data.get("weather_traffic_alert"):
+                    live_updates.append(live_data["weather_traffic_alert"])
+
+                disaster_alert = live_data.get("disaster_alert") or {
+                    "has_disaster": False, "disaster_type": "none", "severity": "none",
+                    "headline": "", "affected_areas": [], "action_advice": ""
+                }
+
+                attraction_alerts = live_data.get("attraction_alerts", [])
+                has_attraction_issue = any(
+                    a.get("status") in ["closed", "restricted"] for a in attraction_alerts if isinstance(a, dict)
+                )
+                has_disaster_issue = bool(disaster_alert.get("has_disaster")) and disaster_alert.get("severity") in ["critical", "warning"]
+                has_disruption = bool(live_data.get("has_disruption", False)) or has_attraction_issue or has_disaster_issue
+
+                result = {
+                    "status": "success",
+                    "city": city or target_term,
+                    "target_date": target_date.isoformat(),
+                    "is_today": is_today,
+                    "has_disruption": has_disruption,
+                    "notice_type": live_data.get("notice_type", "disaster_alert" if has_disaster_issue else ("live_incident" if (is_today and has_disruption) else ("scheduled_maintenance" if (not is_today and has_disruption) else "regular_advisory"))),
+                    "transit_status": live_data.get("transit_status", "normal"),
+                    "disaster_alert": disaster_alert,
+                    "title": live_data.get("title", f"ข้อมูลการเดินทาง {target_term}"),
+                    "summary": live_data.get("summary", ""),
+                    "disruptions": live_data.get("disruptions", []),
+                    "attraction_alerts": attraction_alerts,
+                    "special_events": live_data.get("special_events", []),
+                    "weather_traffic_alert": live_data.get("weather_traffic_alert", ""),
+                    "advice_for_travelers": live_data.get("advice_for_travelers", ""),
+                    "local_tips_and_rules": live_data.get("local_tips_and_rules", ""),
+                    "sources": live_data.get("sources", []),
+                    "tips": tips,
+                    "live_updates": live_updates,
+                    "sources_count": len(live_data.get("sources", [])),
+                    "model": used_model
+                }
+                set_cached_live_check(cache_key, result, ttl_seconds=300)
+                return jsonify(result)
+
+        # 4. Fallback if OpenRouter unavailable
+        fallback_live_updates = [item[:180] for item in disaster_news_items] if disaster_news_items else []
+        has_fallback_disaster = any(
+            any(w in item for w in ["น้ำท่วม", "flood", "storm", "พายุ", "แผ่นดินไหว", "earthquake", "ปิดถนน", "closure", "strike", "grève"])
+            for item in fallback_live_updates
+        )
+
+        fallback_res = {
+            "status": "fallback",
+            "city": city or target_term,
+            "target_date": target_date.isoformat(),
+            "is_today": is_today,
+            "has_disruption": has_fallback_disaster,
+            "notice_type": "disaster_alert" if has_fallback_disaster else "regular_advisory",
+            "transit_status": "warning" if has_fallback_disaster else "normal",
+            "disaster_alert": {
+                "has_disaster": has_fallback_disaster,
+                "disaster_type": "flood" if any("น้ำท่วม" in item or "flood" in item.lower() for item in fallback_live_updates) else ("general_disaster" if has_fallback_disaster else "none"),
+                "severity": "warning" if has_fallback_disaster else "none",
+                "headline": fallback_live_updates[0] if fallback_live_updates and has_fallback_disaster else "",
+                "affected_areas": [target_term] if has_fallback_disaster else [],
+                "action_advice": f"โปรดตรวจสอบเส้นทางก่อนออกเดินทาง หรือใช้ {country_ctx['transit_apps']}"
+            },
+            "title": f"ข้อมูลการเดินทาง {target_term}",
+            "summary": fallback_live_updates[0] if fallback_live_updates else f"ข้อมูลการเดินทางใน {target_term}",
+            "disruptions": [],
+            "attraction_alerts": [],
+            "special_events": [],
+            "weather_traffic_alert": fallback_live_updates[0] if fallback_live_updates else "",
+            "advice_for_travelers": f"ตรวจสอบเส้นทางและสภาพการจราจรก่อนออกเดินทาง แนะนำใช้งาน {country_ctx['transit_apps']}",
+            "local_tips_and_rules": "",
+            "sources": [item.split("]")[0].strip("[") for item in fallback_live_updates if "]" in item],
+            "tips": [f"ข้อมูลสำหรับการเดินทาง {target_term}: วางแผนการเดินทางล่วงหน้า"] + fallback_live_updates[:2],
+            "live_updates": fallback_live_updates,
+            "sources_count": len(fallback_live_updates)
+        }
+        fallback_res = sanitize_buddy_live_data(fallback_res, target_date, is_today, target_term)
+        return jsonify(fallback_res)
+
+    except Exception as e:
+        print("[Error in /ai/buddy-live-check]:", e)
+        return jsonify({
+            "tips": [],
+            "live_updates": [],
+            "sources": [],
+            "sources_count": 0,
+            "has_disruption": False,
+            "transit_status": "normal",
+            "notice_type": "regular_advisory",
+            "disaster_alert": {"has_disaster": False, "disaster_type": "none", "severity": "none", "headline": "", "affected_areas": [], "action_advice": ""},
+            "attraction_alerts": [],
+            "special_events": [],
+            "local_tips_and_rules": "",
+            "error": str(e)
+        }), 200
+
+
+# --------------------
+# Geoapify & Routing Proxy
+# --------------------
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2.0) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2.0) ** 2)
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return R * c
+
+@app.route("/routing", methods=["GET"])
+def proxy_routing():
+    """
+    Proxies routing requests to Geoapify. If Geoapify returns 400 (e.g. waypoint is off-road,
+    in water, or on an unroutable peak like Mount Batur) or any network error,
+    it automatically falls back to Haversine driving estimates, returning HTTP 200 JSON
+    without polluting the browser console with red HTTP 400 errors.
+    """
+    try:
+        waypoints = request.args.get("waypoints")  # format: "lat1,lon1|lat2,lon2"
+        mode = request.args.get("mode", "drive")
+
+        if not waypoints or "|" not in waypoints:
+            return jsonify({"error": "Invalid waypoints format, expected lat1,lon1|lat2,lon2"}), 400
+
+        parts = waypoints.split("|")
+        origin_lat, origin_lon = map(float, parts[0].split(","))
+        dest_lat, dest_lon = map(float, parts[1].split(","))
+
+        # Check for same point
+        if abs(origin_lat - dest_lat) < 0.0001 and abs(origin_lon - dest_lon) < 0.0001:
+            return jsonify({
+                "status": "ok",
+                "distance": 0,
+                "time": 60,
+                "distanceText": "0 m",
+                "durationText": "1 min",
+                "source": "exact"
+            })
+
+        # Strategy 1: Mapbox Directions API v5 (Fast, accurate driving distance & duration)
+        mapbox_token = os.getenv("MAPBOX_ACCESS_TOKEN", MAPBOX_ACCESS_TOKEN)
+        if mapbox_token:
+            mapbox_url = f"https://api.mapbox.com/directions/v5/mapbox/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}?access_token={mapbox_token}&geometries=geojson"
+            try:
+                m_resp = requests.get(mapbox_url, timeout=5)
+                if m_resp.ok:
+                    m_data = m_resp.json()
+                    routes = m_data.get("routes", [])
+                    if routes:
+                        r0 = routes[0]
+                        distance_m = r0.get("distance", 0)
+                        time_sec = r0.get("duration", 0)
+                        dist_km = distance_m / 1000.0
+                        mins = int(round(time_sec / 60))
+                        dur_text = f"{mins} min" if time_sec < 3600 else f"{int(time_sec // 3600)}h {int(round((time_sec % 3600) / 60))}min"
+                        dist_text = f"{dist_km:.1f} km" if distance_m >= 1000 else f"{int(distance_m)} m"
+                        return jsonify({
+                            "status": "ok",
+                            "distance": distance_m,
+                            "time": time_sec,
+                            "distanceText": dist_text,
+                            "durationText": dur_text,
+                            "source": "mapbox"
+                        })
+                else:
+                    print(f"[Routing Proxy] Mapbox returned {m_resp.status_code}: {m_resp.text[:100]}")
+            except Exception as m_err:
+                print(f"[Routing Proxy] Mapbox request error: {m_err}")
+
+        # Strategy 2: Geoapify Routing API (Fallback)
+        api_key = os.getenv("GEOAPIFY_API_KEY", GEOAPIFY_API_KEY)
+        if api_key:
+            url = f"https://api.geoapify.com/v1/routing?waypoints={waypoints}&mode={mode}&apiKey={api_key}"
+            try:
+                resp = requests.get(url, timeout=6)
+                if resp.ok:
+                    data = resp.json()
+                    features = data.get("features", [])
+                    if features and "properties" in features[0]:
+                        props = features[0]["properties"]
+                        distance_m = props.get("distance", 0)
+                        time_sec = props.get("time", 0)
+                        dist_km = distance_m / 1000.0
+                        mins = int(round(time_sec / 60))
+                        dur_text = f"{mins} min" if time_sec < 3600 else f"{int(time_sec // 3600)}h {int(round((time_sec % 3600) / 60))}min"
+                        dist_text = f"{dist_km:.1f} km" if distance_m >= 1000 else f"{int(distance_m)} m"
+                        return jsonify({
+                            "status": "ok",
+                            "distance": distance_m,
+                            "time": time_sec,
+                            "distanceText": dist_text,
+                            "durationText": dur_text,
+                            "source": "geoapify"
+                        })
+                else:
+                    print(f"[Routing Proxy] Geoapify returned {resp.status_code} for {waypoints}: {resp.text[:100]}")
+            except Exception as req_err:
+                print(f"[Routing Proxy] Geoapify request error: {req_err}")
+
+        # Haversine fallback (35 km/h avg speed + 3 min buffer)
+        dist_km = _haversine_km(origin_lat, origin_lon, dest_lat, dest_lon)
+        est_sec = int(round((dist_km / 35.0) * 3600)) + 180
+        dist_m = int(round(dist_km * 1000))
+        mins = int(round(est_sec / 60))
+        dur_text = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60}min"
+        dist_text = f"{dist_km:.1f} km" if dist_km >= 1.0 else f"{dist_m} m"
+
+        return jsonify({
+            "status": "ok",
+            "distance": dist_m,
+            "time": est_sec,
+            "distanceText": dist_text,
+            "durationText": dur_text,
+            "source": "haversine_fallback"
+        })
+    except Exception as e:
+        print(f"[Routing Proxy] General error: {e}")
+        return jsonify({"error": str(e), "status": "error"}), 500
+
+
+
+
+# --------------------
+# Flight: Status (AviationStack)
+# --------------------
+
+@app.route("/flight/status", methods=["POST"])
+def flight_status():
+    """
+    Proxy to AviationStack – returns real-time status for a given flight.
+    Body: { "flight_iata": "TG682" }
+    """
+    if not AVIATIONSTACK_API_KEY:
+        return jsonify({"error": "AviationStack API key not configured"}), 500
+
+    data = request.get_json()
+    if not data or "flight_iata" not in data:
+        return jsonify({"error": "flight_iata is required"}), 400
+
+    flight_iata = data["flight_iata"].strip().upper()
+
+    try:
+        resp = requests.get(
+            "http://api.aviationstack.com/v1/flights",
+            params={
+                "access_key": AVIATIONSTACK_API_KEY,
+                "flight_iata": flight_iata,
+                "limit": 1,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+
+        flights = raw.get("data", [])
+        if not flights:
+            return jsonify({"error": f"No flight found for {flight_iata}"}), 404
+
+        f = flights[0]
+
+        # Normalize into a clean response
+        result = {
+            "flight_iata": f.get("flight", {}).get("iata", flight_iata),
+            "airline": f.get("airline", {}).get("name", ""),
+            "status": f.get("flight_status", "unknown"),
+            "departure": {
+                "airport": f.get("departure", {}).get("airport", ""),
+                "iata": f.get("departure", {}).get("iata", ""),
+                "scheduled": f.get("departure", {}).get("scheduled"),
+                "actual": f.get("departure", {}).get("actual"),
+                "estimated": f.get("departure", {}).get("estimated"),
+                "terminal": f.get("departure", {}).get("terminal"),
+                "gate": f.get("departure", {}).get("gate"),
+                "delay": f.get("departure", {}).get("delay"),
+            },
+            "arrival": {
+                "airport": f.get("arrival", {}).get("airport", ""),
+                "iata": f.get("arrival", {}).get("iata", ""),
+                "scheduled": f.get("arrival", {}).get("scheduled"),
+                "actual": f.get("arrival", {}).get("actual"),
+                "estimated": f.get("arrival", {}).get("estimated"),
+                "terminal": f.get("arrival", {}).get("terminal"),
+                "gate": f.get("arrival", {}).get("gate"),
+                "baggage": f.get("arrival", {}).get("baggage"),
+                "delay": f.get("arrival", {}).get("delay"),
+            },
+        }
+        return jsonify(result)
+
+    except requests.exceptions.RequestException as e:
+        print("AviationStack Error:", e)
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        print("flight_status Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# Flight: Offers (Google Flights via RapidAPI)
+# --------------------
+
+import time as _time
+
+_flight_offers_cache = {}  # key -> (timestamp, data)
+_flight_trends_cache = {}  # key -> (timestamp, data)
+_CACHE_TTL_SECONDS = 3600  # 1 hour cache to conserve RapidAPI quota
+
+@app.route("/flight/offers", methods=["POST"])
+def flight_offers():
+    """
+    Proxy to Google Flights (RapidAPI) – returns up to 5 cheapest one-way flight offers.
+    Body: { "origin": "BKK", "destination": "NRT", "date": "2026-09-01", "passengers": 1, "currency": "THB" }
+    """
+    if not RAPIDAPI_KEY:
+        return jsonify({"error": "RapidAPI key not configured"}), 500
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body required"}), 400
+
+    origin = data.get("origin", "").strip().upper()
+    destination = data.get("destination", "").strip().upper()
+    departure_date = data.get("date", "")
+    passengers = int(data.get("passengers", 1))
+    currency = data.get("currency", "THB")
+
+    if not origin or not destination or not departure_date:
+        return jsonify({"error": "origin, destination, and date are required"}), 400
+
+    cache_key = f"{origin}_{destination}_{departure_date}_{passengers}_{currency}"
+    cached = _flight_offers_cache.get(cache_key)
+    if cached and (_time.time() - cached[0]) < _CACHE_TTL_SECONDS:
+        print(f"[Offers] Returning cached offers for {cache_key}")
+        return jsonify(cached[1])
+
+    try:
+        rapidapi_headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": "google-flights2.p.rapidapi.com",
+        }
+
+        params = {
+            "departure_id": origin,
+            "arrival_id": destination,
+            "outbound_date": departure_date,
+            "travel_class": "ECONOMY",
+            "adults": str(passengers),
+            "show_hidden": "1",
+            "currency": currency,
+            "language_code": "en-US",
+            "country_code": "TH",
+            "search_type": "best",
+        }
+
+        resp = requests.get(
+            "https://google-flights2.p.rapidapi.com/api/v1/searchFlights",
+            headers=rapidapi_headers,
+            params=params,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+
+        if not raw.get("status"):
+            return jsonify({"error": raw.get("message", "Google Flights returned no results")}), 502
+
+        # Collect top flights + other flights, limited to 5
+        itineraries = raw.get("data", {}).get("itineraries", {})
+        all_flights = (
+            itineraries.get("topFlights", []) +
+            itineraries.get("otherFlights", [])
+        )[:5]
+
+        results = []
+        for idx, flight in enumerate(all_flights):
+            flights_list = flight.get("flights", [])
+            first_flight = flights_list[0] if flights_list else {}
+            last_flight = flights_list[-1] if flights_list else {}
+
+            dep_airport = first_flight.get("departure_airport", {})
+            arr_airport = last_flight.get("arrival_airport", {})
+
+            # Normalize departure/arrival times: API returns "2026-9-1 23:35" format
+            dep_time_raw = dep_airport.get("time", "")
+            arr_time_raw = arr_airport.get("time", "")
+
+            def normalize_time(t):
+                """Convert '2026-9-1 23:35' -> '2026-09-01T23:35:00'"""
+                if not t:
+                    return ""
+                try:
+                    parts = t.split(" ")
+                    date_parts = parts[0].split("-")
+                    y, m, d = date_parts[0], date_parts[1].zfill(2), date_parts[2].zfill(2)
+                    time_part = parts[1] if len(parts) > 1 else "00:00"
+                    return f"{y}-{m}-{d}T{time_part}:00"
+                except Exception:
+                    return t
+
+            # Duration: API gives raw minutes
+            duration_raw = flight.get("duration", {}).get("raw", 0)
+            duration_h = duration_raw // 60
+            duration_m = duration_raw % 60
+            duration_str = f"PT{duration_h}H{duration_m}M" if duration_raw else ""
+
+            stops = flight.get("stops", 0)
+            layovers = flight.get("layovers", None)
+            if stops == 0 and layovers:
+                stops = len(layovers)
+
+            # Booking token for building a deep link
+            booking_token = flight.get("booking_token", "")
+            deep_link = (
+                f"https://www.google.com/travel/flights?tfs={booking_token}"
+                if booking_token
+                else f"https://www.google.com/travel/flights?q=Flights+from+{origin}+to+{destination}"
+            )
+
+            results.append({
+                "offer_id": f"gf_{departure_date}_{origin}_{destination}_{idx}",
+                "airline": first_flight.get("airline", ""),
+                "airline_logo": first_flight.get("airline_logo", ""),
+                "flight_number": first_flight.get("flight_number", ""),
+                "departure_iata": dep_airport.get("airport_code", origin),
+                "arrival_iata": arr_airport.get("airport_code", destination),
+                "departure_time": normalize_time(dep_time_raw),
+                "arrival_time": normalize_time(arr_time_raw),
+                "duration": duration_str,
+                "stops": stops,
+                "currency": currency,
+                "total_amount": str(flight.get("price", 0)),
+                "deep_link": deep_link,
+            })
+
+        response_payload = {"offers": results}
+        _flight_offers_cache[cache_key] = (_time.time(), response_payload)
+        return jsonify(response_payload)
+
+    except requests.exceptions.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.response.json()
+        except Exception:
+            err_body = e.response.text
+        print("Google Flights HTTPError:", err_body)
+        return jsonify({"error": str(err_body)}), e.response.status_code
+    except Exception as e:
+        print("flight_offers Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# Flight: Price Trends (Google Flights Calendar Grid)
+# --------------------
+
+def _generate_estimated_flight_trends(origin, destination, start_date_str, currency="THB"):
+    """
+    Generate realistic 30-day estimated flight trends when RapidAPI quota is exhausted or API is offline.
+    """
+    from datetime import datetime, timedelta
+    import random
+    
+    base_price = 4500
+    route = f"{origin}-{destination}"
+    if any(k in route for k in ["NRT", "HND", "KIX", "ICN"]):
+        base_price = 6500
+    elif any(k in route for k in ["LHR", "CDG", "JFK", "LAX", "FRA"]):
+        base_price = 18500
+    elif any(k in route for k in ["HKT", "CNX", "KBV", "USM", "HDY"]):
+        base_price = 1450
+    elif any(k in route for k in ["SIN", "KUL", "HKG", "TPE"]):
+        base_price = 3800
+        
+    try:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+    except Exception:
+        start_dt = datetime.now()
+        
+    trends = []
+    seed_val = sum(ord(c) for c in route) + start_dt.month
+    rng = random.Random(seed_val)
+    
+    for day_offset in range(30):
+        current_dt = start_dt + timedelta(days=day_offset)
+        weekday = current_dt.weekday()
+        if weekday in [4, 6]:  # Fri, Sun
+            day_factor = 1.18 + rng.uniform(-0.03, 0.05)
+        elif weekday in [1, 2]: # Tue, Wed
+            day_factor = 0.88 + rng.uniform(-0.04, 0.03)
+        elif weekday == 5: # Sat
+            day_factor = 1.08 + rng.uniform(-0.03, 0.04)
+        else:
+            day_factor = 0.95 + rng.uniform(-0.03, 0.03)
+            
+        final_price = int(round(base_price * day_factor / 50) * 50)
+        trends.append({
+            "date": current_dt.strftime("%Y-%m-%d"),
+            "price": final_price
+        })
+    return trends
+
+
+# --------------------
+# Flight: Price Trends (Google Flights Calendar Grid)
+# --------------------
+
+@app.route("/flight/trends", methods=["POST"])
+def flight_trends():
+    """
+    Returns a 30-day price calendar for cheapest fares on each day.
+    Uses Google Flights getCalendarGrid endpoint via RapidAPI with graceful estimation fallback.
+    Body: { "origin": "BKK", "destination": "NRT", "date": "2026-09-01", "currency": "THB" }
+    """
+    data = request.get_json() or {}
+    origin = data.get("origin", "").strip().upper() or "BKK"
+    destination = data.get("destination", "").strip().upper() or "NRT"
+    departure_date = data.get("date", "")
+    currency = data.get("currency", "THB")
+
+    if not origin or not destination:
+        return jsonify({"error": "origin and destination are required"}), 400
+
+    cache_key = f"{origin}_{destination}_{departure_date}_{currency}"
+    cached = _flight_trends_cache.get(cache_key)
+    if cached and (_time.time() - cached[0]) < _CACHE_TTL_SECONDS:
+        print(f"[Trends] Returning cached calendar trends for {cache_key}")
+        return jsonify(cached[1])
+
+    if not RAPIDAPI_KEY:
+        print("[Trends] RAPIDAPI_KEY not set. Using estimated trends fallback.")
+        trends = _generate_estimated_flight_trends(origin, destination, departure_date, currency)
+        return jsonify({"trends": trends, "currency": currency, "is_estimated": True})
+
+    try:
+        rapidapi_headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": "google-flights2.p.rapidapi.com",
+        }
+
+        params = {
+            "departure_id": origin,
+            "arrival_id": destination,
+            "travel_class": "ECONOMY",
+            "adults": "1",
+            "currency": currency,
+            "country_code": "TH",
+        }
+        if departure_date:
+            params["outbound_date"] = departure_date
+
+        resp = requests.get(
+            "https://google-flights2.p.rapidapi.com/api/v1/getCalendarGrid",
+            headers=rapidapi_headers,
+            params=params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+
+        # Fallback: if status=False, retry without outbound_date
+        if not raw.get("status") and "outbound_date" in params:
+            print(f"[Trends] Request with outbound_date={departure_date} returned status=False. Retrying without date...")
+            params.pop("outbound_date")
+            try:
+                resp = requests.get(
+                    "https://google-flights2.p.rapidapi.com/api/v1/getCalendarGrid",
+                    headers=rapidapi_headers,
+                    params=params,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                raw = resp.json()
+            except Exception as e:
+                print(f"[Trends] Fallback request failed: {e}")
+
+        calendar = raw.get("data", [])
+        trends = [
+            {"date": item["departure"], "price": item["price"]}
+            for item in calendar
+            if item.get("departure") and item.get("price") is not None
+        ]
+
+        if not trends:
+            print(f"[Trends] Google Flights returned empty data ({raw.get('message')}). Using estimated fallback.")
+            trends = _generate_estimated_flight_trends(origin, destination, departure_date, currency)
+
+        response_payload = {"trends": trends, "currency": currency}
+        _flight_trends_cache[cache_key] = (_time.time(), response_payload)
+        return jsonify(response_payload)
+
+    except Exception as e:
+        print("[Trends] Graceful recovery from flight_trends error:", e)
+        trends = _generate_estimated_flight_trends(origin, destination, departure_date, currency)
+        return jsonify({"trends": trends, "currency": currency, "is_estimated": True})
+
+
+
+
+
+# --------------------
+# Save/Read Experiment Results (Exp 1 - 5 with Token & Cost Benchmarking)
+# --------------------
+# EXP SCHEMAS & PATHS (Reordered: Exp 1 Prompt, Exp 2 Benchmark, Exp 3 Pipeline, Exp 4 Robustness, Exp 5 Consistency, Exp 6 Plan)
+# --------------------
+
+EXP1_FIELDNAMES = [
+    "Timestamp", "Image Name", "Ground Truth", "Tier", "Model",
+    "Prompt Variant ID", "Prompt Variant Name",
+    "Predicted Place", "Confidence", "Time MS", "Is Correct",
+    "Recall Rank", "Matched Alias", "AI Reasoning",
+    "Temperature", "Failure Mode",
+    "Prompt Tokens", "Completion Tokens", "Total Tokens", "Cost USD", "Tokens Per Sec",
+    "Generation Time MS", "Pure Tokens Per Sec", "Provider Name", "OpenRouter ID"
+]
+
+EXP2_FIELDNAMES = [
+    "Timestamp", "Image Name", "Ground Truth", "Tier", "Model",
+    "Prompt Variant ID", "Prompt Variant Name",
+    "Predicted Place", "Confidence", "Time MS", "Is Correct",
+    "Recall Rank", "Matched Alias", "AI Reasoning",
+    "Temperature", "Failure Mode",
+    "Prompt Tokens", "Completion Tokens", "Total Tokens", "Cost USD", "Tokens Per Sec",
+    "Generation Time MS", "Pure Tokens Per Sec", "Provider Name", "OpenRouter ID"
+]
+
+EXP3_FIELDNAMES = [
+    "Timestamp", "Image Name", "Ground Truth", "Tier", "Model",
+    "Prompt Variant",
+    "Top 1 Place", "Confidence",
+    "Candidate 1 Name", "Candidate 1 Score", "Candidate 1 Failure Mode",
+    "Candidate 2 Name", "Candidate 2 Score", "Candidate 2 Failure Mode",
+    "Candidate 3 Name", "Candidate 3 Score", "Candidate 3 Failure Mode",
+    "Top 1 Strict", "Top 3 Recall", "Avg Candidate Score",
+    "Failure Mode", "AI Reasoning",
+    "Time MS", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Cost USD", "Tokens Per Sec",
+    "Generation Time MS", "Pure Tokens Per Sec", "Provider Name", "OpenRouter ID",
+    # Legacy fields retained for backward-compatibility
+    "Predicted (CLIP)", "Predicted (No CLIP)", "Confidence (CLIP)", "Confidence (No CLIP)",
+    "Correct (CLIP)", "Correct (No CLIP)", "Latency CLIP (ms)", "Latency No CLIP (ms)", "Delta Latency (ms)"
+]
+
+EXP4_FIELDNAMES = [
+    "Timestamp", "Landmark Ground Truth", "Image Name", "Tier",
+    "Condition Category", "Condition Label",
+    "Prompt Variant ID", "Prompt Variant Name",
+    "Model", "Predicted Place", "Confidence", "Time MS", "Is Correct",
+    "Recall Rank", "Matched Alias", "AI Reasoning",
+    "Temperature", "Failure Mode",
+    "Prompt Tokens", "Completion Tokens", "Total Tokens", "Cost USD", "Tokens Per Sec",
+    "Generation Time MS", "Pure Tokens Per Sec", "Provider Name", "OpenRouter ID"
+]
+
+EXP5_FIELDNAMES = [
+    "Timestamp", "Session ID", "Image Name", "Ground Truth", "Tier", "Model",
+    "Run Number", "Total Runs",
+    "Prompt Variant ID", "Prompt Variant Name",
+    "Predicted Place", "Confidence", "Time MS", "Is Correct",
+    "Recall Rank", "Matched Alias", "AI Reasoning",
+    "Temperature", "Failure Mode",
+    "Prompt Tokens", "Completion Tokens", "Total Tokens", "Cost USD", "Tokens Per Sec",
+    "Generation Time MS", "Pure Tokens Per Sec", "Provider Name", "OpenRouter ID"
+]
+
+EXP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "experiment"))
+EXP1_CSV_PATH = os.path.join(EXP_DIR, "exp1_prompt_sensitivity.csv")
+EXP2_CSV_PATH = os.path.join(EXP_DIR, "exp2_model_benchmark.csv")
+EXP2_LEGACY_CSV_PATH = os.path.join(EXP_DIR, "experiment_results.csv")
+EXP3_CSV_PATH = os.path.join(EXP_DIR, "exp3_pipeline_comparison.csv")
+EXP4_CSV_PATH = os.path.join(EXP_DIR, "exp4_robustness.csv")
+EXP5_CSV_PATH = os.path.join(EXP_DIR, "exp5_consistency.csv")
+EXP6_CSV_PATH = os.path.join(EXP_DIR, "exp6_plan_evaluation.csv")
+EXP6_SIDECAR_CSV_PATH = os.path.join(EXP_DIR, "exp6_plan_evaluation_runs.csv")
+
+
+
+def _get_experiment_csv_path(filename: str) -> str:
+    parent_exp = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "experiment"))
+    if os.path.exists(parent_exp):
+        return os.path.join(parent_exp, filename)
+    local_exp = os.path.abspath(os.path.join(os.path.dirname(__file__), "experiment"))
+    if os.path.exists(local_exp):
+        return os.path.join(local_exp, filename)
+    cwd_exp = os.path.abspath(os.path.join("experiment", filename))
+    if os.path.exists(os.path.dirname(cwd_exp)):
+        return cwd_exp
+    os.makedirs(parent_exp, exist_ok=True)
+    return os.path.join(parent_exp, filename)
+
+
+
+def ensure_csv_file(csv_path, expected_fieldnames):
+    """
+    Ensures that csv_path exists with all expected_fieldnames.
+    If the file exists with older/fewer columns, migrates existing data to the new header schema.
+    """
+    import csv
+    if not os.path.exists(csv_path):
+        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+        with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(expected_fieldnames)
+        return
+
+    try:
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            existing_header = next(reader, [])
+    except Exception:
+        existing_header = []
+
+    if existing_header and existing_header != expected_fieldnames:
+        old_rows = []
+        try:
+            with open(csv_path, mode="r", encoding="utf-8") as f:
+                d_reader = csv.DictReader(f)
+                for r in d_reader:
+                    old_rows.append(r)
+
+            with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+                d_writer = csv.DictWriter(f, fieldnames=expected_fieldnames, extrasaction="ignore")
+                d_writer.writeheader()
+                for r in old_rows:
+                    row_dict = {}
+                    for col in expected_fieldnames:
+                        val = r.get(col)
+                        if val in (None, "") and col == "Tier":
+                            val = "tier1_iconic"
+                        elif val in (None, "") and col in ("Failure Mode", "Failure Mode (CLIP)", "Failure Mode (No CLIP)"):
+                            val = "none"
+                        elif val in (None, "") and col == "Temperature":
+                            val = "0.1"
+                        elif val in (None, "") and col in ("Prompt Variant ID", "Prompt Variant"):
+                            val = "P1"
+                        elif val in (None, "") and col == "Prompt Variant Name":
+                            val = "P1: Zero-Shot Direct (EN)"
+                        elif val in (None, "") and col == "Recall Rank":
+                            is_c = r.get("Is Correct") or r.get("Correct") or r.get("Correct (CLIP)")
+                            val = "1" if str(is_c).lower() in ("true", "1") else "0"
+                        elif val is None:
+                            val = ""
+                        row_dict[col] = val
+                    d_writer.writerow(row_dict)
+        except Exception as e:
+            print(f"Warning: could not migrate CSV {csv_path}: {e}")
+
+
+# --------------------
+# EXP 1: Prompt Sensitivity Endpoints (Formerly Exp 4, Thesis Chap. 4.1)
+# --------------------
+
+@app.route("/experiment/save_exp1", methods=["POST"])
+def save_exp1():
+    import csv, datetime
+    data = request.get_json()
+    if not data or "results" not in data:
+        return jsonify({"error": "Missing data"}), 400
+
+    os.makedirs("../experiment", exist_ok=True)
+    csv_path = EXP1_CSV_PATH
+
+    try:
+        ensure_csv_file(csv_path, EXP1_FIELDNAMES)
+        with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=EXP1_FIELDNAMES, extrasaction="ignore")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tier = data.get("tier") or "tier1_iconic"
+            temperature = data.get("temperature", 0.0)
+
+            for res in data["results"]:
+                gen_metrics = get_generation_metrics(res.get("openrouter_id"), res.get("completion_tokens", 0))
+                is_corr = res.get("is_correct")
+                rank = res.get("recall_rank")
+                if rank is None:
+                    rank = 1 if (is_corr is True or is_corr == "True" or is_corr == "true" or is_corr == 1) else 0
+
+                writer.writerow({
+                    "Timestamp": timestamp,
+                    "Image Name": data.get("image_name"),
+                    "Ground Truth": data.get("ground_truth"),
+                    "Tier": res.get("tier") or tier,
+                    "Model": res.get("model"),
+                    "Prompt Variant ID": res.get("variant_id"),
+                    "Prompt Variant Name": res.get("variant_name"),
+                    "Predicted Place": res.get("predicted"),
+                    "Confidence": res.get("confidence"),
+                    "Time MS": res.get("time_ms"),
+                    "Is Correct": res.get("is_correct"),
+                    "Recall Rank": rank,
+                    "Matched Alias": res.get("matched_alias") or "",
+                    "AI Reasoning": res.get("reasoning") or res.get("ai_reasoning") or "",
+                    "Temperature": res.get("temperature", temperature),
+                    "Failure Mode": res.get("failure_mode", "none"),
+                    "Prompt Tokens": res.get("prompt_tokens", 0),
+                    "Completion Tokens": res.get("completion_tokens", 0),
+                    "Total Tokens": res.get("total_tokens", 0),
+                    "Cost USD": res.get("cost_usd", 0.0),
+                    "Tokens Per Sec": res.get("tokens_per_sec", 0.0),
+                    "Generation Time MS": gen_metrics["generation_time_ms"],
+                    "Pure Tokens Per Sec": gen_metrics["pure_tokens_per_sec"],
+                    "Provider Name": gen_metrics["provider_name"],
+                    "OpenRouter ID": gen_metrics["openrouter_id"]
+                })
+        return jsonify({"status": "success", "message": "Results saved successfully to exp1_prompt_sensitivity.csv"})
+    except Exception as e:
+        print("Error saving exp1:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/experiment/results_exp1", methods=["GET"])
+def get_exp1_results():
+    import csv
+    csv_path = EXP1_CSV_PATH
+    if not os.path.exists(csv_path):
+        return jsonify({"results": []})
+    
+    # Auto-backfill any missing generation stats
+    backfill_csv_generation_stats(csv_path)
+
+    try:
+        results = []
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                d = dict(row)
+                if not d.get("Tier"):
+                    d["Tier"] = "tier1_iconic"
+                results.append(d)
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# EXP 2: VPR Accuracy / Multi-Model Benchmark Endpoints (Formerly Exp 1, Thesis Chap. 4.2)
+# --------------------
+
+@app.route("/experiment/save_exp2", methods=["POST"])
+@app.route("/experiment/save", methods=["POST"])
+def save_exp2():
+    """
+    Appends experiment trial data to local exp2_model_benchmark.csv with multi-alias, recall rank, tier, and token/cost metrics.
+    """
+    import csv
+    import datetime
+
+    data = request.get_json()
+    if not data or "image_name" not in data or "ground_truth" not in data or "results" not in data:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    image_name = data["image_name"]
+    ground_truth = data["ground_truth"]
+    tier = data.get("tier") or "tier1_iconic"
+    temperature = data.get("temperature", 0.0)
+    results = data["results"]
+
+    os.makedirs("../experiment", exist_ok=True)
+    csv_path = EXP2_CSV_PATH
+
+    # Migrate from legacy experiment_results.csv if exp2_model_benchmark.csv doesn't exist
+    if not os.path.exists(csv_path) and os.path.exists(EXP2_LEGACY_CSV_PATH):
+        try:
+            ensure_csv_file(EXP2_LEGACY_CSV_PATH, EXP2_FIELDNAMES)
+            import shutil
+            shutil.copyfile(EXP2_LEGACY_CSV_PATH, csv_path)
+            print(f"[Migration] Copied {EXP2_LEGACY_CSV_PATH} to {csv_path}")
+        except Exception as mig_err:
+            print(f"[Migration Warning] Could not copy legacy CSV: {mig_err}")
+
+    try:
+        ensure_csv_file(csv_path, EXP2_FIELDNAMES)
+        with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=EXP2_FIELDNAMES, extrasaction="ignore")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            for res in results:
+                is_corr = res.get("is_correct")
+                rank = res.get("recall_rank")
+                if rank is None:
+                    rank = 1 if (is_corr is True or is_corr == "True" or is_corr == "true" or is_corr == 1) else 0
+
+                gen_metrics = get_generation_metrics(res.get("openrouter_id"), res.get("completion_tokens", 0))
+
+                writer.writerow({
+                    "Timestamp": timestamp,
+                    "Image Name": image_name,
+                    "Ground Truth": ground_truth,
+                    "Tier": res.get("tier") or tier,
+                    "Model": res.get("model"),
+                    "Prompt Variant ID": res.get("variant_id") or "P1",
+                    "Prompt Variant Name": res.get("variant_name") or "P1: Zero-Shot Direct (EN)",
+                    "Predicted Place": res.get("predicted"),
+                    "Confidence": res.get("confidence"),
+                    "Time MS": res.get("time_ms"),
+                    "Is Correct": res.get("is_correct"),
+                    "Recall Rank": rank,
+                    "Matched Alias": res.get("matched_alias") or "",
+                    "AI Reasoning": res.get("reasoning") or res.get("ai_reasoning") or "",
+                    "Temperature": res.get("temperature", temperature),
+                    "Failure Mode": res.get("failure_mode", "none"),
+                    "Prompt Tokens": res.get("prompt_tokens", 0),
+                    "Completion Tokens": res.get("completion_tokens", 0),
+                    "Total Tokens": res.get("total_tokens", 0),
+                    "Cost USD": res.get("cost_usd", 0.0),
+                    "Tokens Per Sec": res.get("tokens_per_sec", 0.0),
+                    "Generation Time MS": gen_metrics["generation_time_ms"],
+                    "Pure Tokens Per Sec": gen_metrics["pure_tokens_per_sec"],
+                    "Provider Name": gen_metrics["provider_name"],
+                    "OpenRouter ID": gen_metrics["openrouter_id"]
+                })
+
+        return jsonify({"status": "success", "message": "Results saved successfully to exp2_model_benchmark.csv"})
+    except Exception as e:
+        print("Error saving experiment:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/experiment/results_exp2", methods=["GET"])
+@app.route("/experiment/results", methods=["GET"])
+def get_exp2_results():
+    """
+    Reads the existing experiment results from local exp2_model_benchmark.csv.
+    """
+    import csv
+    csv_path = EXP2_CSV_PATH
+    if not os.path.exists(csv_path) and os.path.exists(EXP2_LEGACY_CSV_PATH):
+        try:
+            ensure_csv_file(EXP2_LEGACY_CSV_PATH, EXP2_FIELDNAMES)
+            import shutil
+            shutil.copyfile(EXP2_LEGACY_CSV_PATH, csv_path)
+        except Exception:
+            pass
+
+    if not os.path.exists(csv_path):
+        return jsonify({"results": []})
+
+    # Auto-backfill any missing generation stats
+    backfill_csv_generation_stats(csv_path)
+
+    try:
+        results = []
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                is_correct = row.get("Is Correct") == "True" or row.get("Is Correct") == "true" or row.get("Is Correct") == "1"
+                raw_rank = row.get("Recall Rank")
+                rank = int(raw_rank) if raw_rank and raw_rank.isdigit() else (1 if is_correct else 0)
+
+                results.append({
+                    "timestamp": row.get("Timestamp"),
+                    "image_name": row.get("Image Name"),
+                    "ground_truth": row.get("Ground Truth"),
+                    "tier": row.get("Tier") or "tier1_iconic",
+                    "model": row.get("Model"),
+                    "variant_id": row.get("Prompt Variant ID") or "P1",
+                    "variant_name": row.get("Prompt Variant Name") or "P1: Zero-Shot Direct (EN)",
+                    "predicted": row.get("Predicted Place"),
+                    "confidence": float(row.get("Confidence") or 0.0),
+                    "time_ms": int(row.get("Time MS") or 0),
+                    "is_correct": is_correct,
+                    "recall_rank": rank,
+                    "matched_alias": row.get("Matched Alias") or None,
+                    "reasoning": row.get("AI Reasoning") or "",
+                    "temperature": float(row.get("Temperature") or 0.1),
+                    "failure_mode": row.get("Failure Mode") or "none",
+                    "prompt_tokens": int(row.get("Prompt Tokens") or 0),
+                    "completion_tokens": int(row.get("Completion Tokens") or 0),
+                    "total_tokens": int(row.get("Total Tokens") or 0),
+                    "cost_usd": float(row.get("Cost USD") or 0.0),
+                    "tokens_per_sec": float(row.get("Tokens Per Sec") or 0.0),
+                    "generation_time_ms": int(row.get("Generation Time MS")) if row.get("Generation Time MS") and str(row.get("Generation Time MS")).isdigit() else None,
+                    "pure_tokens_per_sec": float(row.get("Pure Tokens Per Sec")) if row.get("Pure Tokens Per Sec") else None,
+                    "provider_name": row.get("Provider Name") or "",
+                    "openrouter_id": row.get("OpenRouter ID") or ""
+                })
+        return jsonify({"results": results})
+    except Exception as e:
+        print("Error reading experiment results:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# EXP 3: Pipeline Comparison Endpoints (Formerly Exp 2, Thesis Chap. 4.3)
+# --------------------
+
+@app.route("/experiment/save_exp3", methods=["POST"])
+def save_exp3():
+    import csv, datetime
+    data = request.get_json()
+    if not data or "results" not in data:
+        return jsonify({"error": "Missing data"}), 400
+
+    os.makedirs("../experiment", exist_ok=True)
+    csv_path = EXP3_CSV_PATH
+
+    try:
+        ensure_csv_file(csv_path, EXP3_FIELDNAMES)
+        with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=EXP3_FIELDNAMES, extrasaction="ignore")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            tier = data.get("tier") or "tier1_iconic"
+            temperature = data.get("temperature", 0.0)
+            prompt_variant = data.get("prompt_variant") or "P1: Zero-Shot Direct (EN)"
+            for res in data["results"]:
+                gen_clip = get_generation_metrics(res.get("openrouter_id_clip") or res.get("openrouter_id"), res.get("tokens_clip", 0) or res.get("total_tokens", 0))
+                gen_noclip = get_generation_metrics(res.get("openrouter_id_noclip"), res.get("tokens_noclip", 0))
+
+                c1_score = int(res.get("candidate_1_score", 0))
+                c2_score = int(res.get("candidate_2_score", 0))
+                c3_score = int(res.get("candidate_3_score", 0))
+                top1_strict = res.get("top1_strict") if res.get("top1_strict") is not None else (c1_score == 3)
+                top3_recall = res.get("top3_recall") if res.get("top3_recall") is not None else any(s >= 2 for s in [c1_score, c2_score, c3_score])
+                avg_score = float(res.get("avg_candidate_score") or round((c1_score + c2_score + c3_score) / 3.0, 2))
+
+                top1_place = res.get("top1_place") or res.get("predicted_clip") or res.get("predicted_noclip") or res.get("candidate_1_name") or ""
+                conf = float(res.get("confidence") if res.get("confidence") is not None else (res.get("confidence_clip") or 0.0))
+
+                writer.writerow({
+                    "Timestamp": timestamp,
+                    "Image Name": data.get("image_name"),
+                    "Ground Truth": data.get("ground_truth"),
+                    "Tier": res.get("tier") or tier,
+                    "Model": res.get("model"),
+                    "Prompt Variant": res.get("prompt_variant") or prompt_variant,
+                    "Top 1 Place": top1_place,
+                    "Confidence": conf,
+                    "Candidate 1 Name": res.get("candidate_1_name") or top1_place,
+                    "Candidate 1 Score": c1_score,
+                    "Candidate 1 Failure Mode": res.get("candidate_1_failure_mode") or ("none" if c1_score == 3 else "visual_confusion"),
+                    "Candidate 2 Name": res.get("candidate_2_name") or "",
+                    "Candidate 2 Score": c2_score,
+                    "Candidate 2 Failure Mode": res.get("candidate_2_failure_mode") or ("none" if c2_score == 3 else "visual_confusion"),
+                    "Candidate 3 Name": res.get("candidate_3_name") or "",
+                    "Candidate 3 Score": c3_score,
+                    "Candidate 3 Failure Mode": res.get("candidate_3_failure_mode") or ("none" if c3_score == 3 else "visual_confusion"),
+                    "Top 1 Strict": top1_strict,
+                    "Top 3 Recall": top3_recall,
+                    "Avg Candidate Score": avg_score,
+                    "Failure Mode": res.get("failure_mode") or res.get("failure_mode_clip") or ("none" if top1_strict else "visual_confusion"),
+                    "AI Reasoning": res.get("reasoning") or res.get("reasoning_clip") or res.get("reasoning_noclip") or "",
+                    "Time MS": res.get("time_ms") or res.get("latency_clip") or 0,
+                    "Prompt Tokens": res.get("prompt_tokens", 0),
+                    "Completion Tokens": res.get("completion_tokens", 0),
+                    "Total Tokens": res.get("total_tokens") or res.get("tokens_clip", 0),
+                    "Cost USD": res.get("cost_usd") or res.get("cost_clip", 0.0),
+                    "Tokens Per Sec": res.get("tokens_per_sec", 0.0),
+                    "Generation Time MS": gen_clip["generation_time_ms"],
+                    "Pure Tokens Per Sec": gen_clip["pure_tokens_per_sec"],
+                    "Provider Name": gen_clip["provider_name"],
+                    "OpenRouter ID": gen_clip["openrouter_id"],
+                    # Legacy fields retained for backward-compatibility
+                    "Predicted (CLIP)": res.get("predicted_clip") or top1_place,
+                    "Predicted (No CLIP)": res.get("predicted_noclip") or "",
+                    "Confidence (CLIP)": conf,
+                    "Confidence (No CLIP)": res.get("confidence_noclip", 0.0),
+                    "Correct (CLIP)": top1_strict,
+                    "Correct (No CLIP)": res.get("correct_noclip", False),
+                    "Latency CLIP (ms)": res.get("latency_clip") or res.get("time_ms") or 0,
+                    "Latency No CLIP (ms)": res.get("latency_noclip", 0),
+                    "Delta Latency (ms)": res.get("delta_latency", 0)
+                })
+        return jsonify({"status": "success", "message": "Results saved successfully to exp3_pipeline_comparison.csv"})
+    except Exception as e:
+        print("Error saving exp3:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/experiment/results_exp3", methods=["GET"])
+def get_exp3_results():
+    import csv
+    csv_path = EXP3_CSV_PATH
+    if not os.path.exists(csv_path):
+        return jsonify({"results": []})
+    
+    # Auto-backfill any missing generation stats
+    backfill_csv_generation_stats(csv_path)
+
+    try:
+        results = []
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                d = dict(row)
+                if not d.get("Tier"):
+                    d["Tier"] = "tier1_iconic"
+                results.append(d)
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# EXP 4: Robustness Test Endpoints (Formerly Exp 3, Thesis Chap. 4.4)
+# --------------------
+
+@app.route("/experiment/save_exp4", methods=["POST"])
+def save_exp4():
+    import csv, datetime
+    data = request.get_json()
+    if not data or "results" not in data:
+        return jsonify({"error": "Missing data"}), 400
+
+    os.makedirs("../experiment", exist_ok=True)
+    csv_path = EXP4_CSV_PATH
+
+    try:
+        ensure_csv_file(csv_path, EXP4_FIELDNAMES)
+        with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=EXP4_FIELDNAMES, extrasaction="ignore")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tier = data.get("tier") or "tier1_iconic"
+            temperature = data.get("temperature", 0.0)
+
+            for res in data["results"]:
+                gen_metrics = get_generation_metrics(res.get("openrouter_id"), res.get("completion_tokens", 0))
+                is_corr = res.get("is_correct")
+                rank = res.get("recall_rank")
+                if rank is None:
+                    rank = 1 if (is_corr is True or is_corr == "True" or is_corr == "true" or is_corr == 1) else 0
+
+                writer.writerow({
+                    "Timestamp": timestamp,
+                    "Landmark Ground Truth": data.get("ground_truth"),
+                    "Image Name": res.get("image_name"),
+                    "Tier": res.get("tier") or tier,
+                    "Condition Category": res.get("condition_category"),
+                    "Condition Label": res.get("condition_label"),
+                    "Prompt Variant ID": res.get("variant_id") or "P1",
+                    "Prompt Variant Name": res.get("variant_name") or "P1: Zero-Shot Direct (EN)",
+                    "Model": res.get("model"),
+                    "Predicted Place": res.get("predicted"),
+                    "Confidence": res.get("confidence"),
+                    "Time MS": res.get("time_ms"),
+                    "Is Correct": res.get("is_correct"),
+                    "Recall Rank": rank,
+                    "Matched Alias": res.get("matched_alias") or "",
+                    "AI Reasoning": res.get("reasoning") or res.get("ai_reasoning") or "",
+                    "Temperature": res.get("temperature", temperature),
+                    "Failure Mode": res.get("failure_mode", "none"),
+                    "Prompt Tokens": res.get("prompt_tokens", 0),
+                    "Completion Tokens": res.get("completion_tokens", 0),
+                    "Total Tokens": res.get("total_tokens", 0),
+                    "Cost USD": res.get("cost_usd", 0.0),
+                    "Tokens Per Sec": res.get("tokens_per_sec", 0.0),
+                    "Generation Time MS": gen_metrics["generation_time_ms"],
+                    "Pure Tokens Per Sec": gen_metrics["pure_tokens_per_sec"],
+                    "Provider Name": gen_metrics["provider_name"],
+                    "OpenRouter ID": gen_metrics["openrouter_id"]
+                })
+        return jsonify({"status": "success", "message": "Results saved successfully to exp4_robustness.csv"})
+    except Exception as e:
+        print("Error saving exp4:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/experiment/results_exp4", methods=["GET"])
+def get_exp4_results():
+    import csv
+    csv_path = EXP4_CSV_PATH
+    if not os.path.exists(csv_path):
+        return jsonify({"results": []})
+    
+    # Auto-backfill any missing generation stats
+    backfill_csv_generation_stats(csv_path)
+
+    try:
+        results = []
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                d = dict(row)
+                if not d.get("Tier"):
+                    d["Tier"] = "tier1_iconic"
+                results.append(d)
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# EXP 5: Consistency / Operational Stability Endpoints
+# --------------------
+
+@app.route("/experiment/save_exp5", methods=["POST"])
+def save_exp5():
+    import csv, datetime
+    data = request.get_json()
+    if not data or "results" not in data:
+        return jsonify({"error": "Missing data"}), 400
+
+    os.makedirs("../experiment", exist_ok=True)
+    csv_path = EXP5_CSV_PATH
+
+    try:
+        ensure_csv_file(csv_path, EXP5_FIELDNAMES)
+        with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=EXP5_FIELDNAMES, extrasaction="ignore")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            session_id = data.get("session_id", datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+            tier = data.get("tier") or "tier1_iconic"
+            temperature = data.get("temperature", 0.0)
+
+            for res in data["results"]:
+                gen_metrics = get_generation_metrics(res.get("openrouter_id"), res.get("completion_tokens", 0))
+                is_corr = res.get("is_correct")
+                rank = res.get("recall_rank")
+                if rank is None:
+                    rank = 1 if (is_corr is True or is_corr == "True" or is_corr == "true" or is_corr == 1) else 0
+
+                writer.writerow({
+                    "Timestamp": timestamp,
+                    "Session ID": session_id,
+                    "Image Name": data.get("image_name"),
+                    "Ground Truth": data.get("ground_truth"),
+                    "Tier": res.get("tier") or tier,
+                    "Model": res.get("model"),
+                    "Run Number": res.get("run_number"),
+                    "Total Runs": res.get("total_runs"),
+                    "Prompt Variant ID": res.get("variant_id") or "P1",
+                    "Prompt Variant Name": res.get("variant_name") or "P1: Zero-Shot Direct (EN)",
+                    "Predicted Place": res.get("predicted"),
+                    "Confidence": res.get("confidence"),
+                    "Time MS": res.get("time_ms"),
+                    "Is Correct": res.get("is_correct"),
+                    "Recall Rank": rank,
+                    "Matched Alias": res.get("matched_alias") or "",
+                    "AI Reasoning": res.get("reasoning") or res.get("ai_reasoning") or "",
+                    "Temperature": res.get("temperature", temperature),
+                    "Failure Mode": res.get("failure_mode", "none"),
+                    "Prompt Tokens": res.get("prompt_tokens", 0),
+                    "Completion Tokens": res.get("completion_tokens", 0),
+                    "Total Tokens": res.get("total_tokens", 0),
+                    "Cost USD": res.get("cost_usd", 0.0),
+                    "Tokens Per Sec": res.get("tokens_per_sec", 0.0),
+                    "Generation Time MS": gen_metrics["generation_time_ms"],
+                    "Pure Tokens Per Sec": gen_metrics["pure_tokens_per_sec"],
+                    "Provider Name": gen_metrics["provider_name"],
+                    "OpenRouter ID": gen_metrics["openrouter_id"]
+                })
+        return jsonify({"status": "success", "message": "Results saved successfully to exp5_consistency.csv"})
+    except Exception as e:
+        print("Error saving exp5:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/experiment/results_exp5", methods=["GET"])
+def get_exp5_results():
+    import csv
+    csv_path = EXP5_CSV_PATH
+    if not os.path.exists(csv_path):
+        return jsonify({"results": []})
+    
+    # Auto-backfill any missing generation stats
+    backfill_csv_generation_stats(csv_path)
+
+    try:
+        results = []
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                d = dict(row)
+                if not d.get("Tier"):
+                    d["Tier"] = "tier1_iconic"
+                results.append(d)
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# EXP 6: Plan Evaluation Endpoints
+# --------------------
+
+@app.route("/experiment/save_exp6", methods=["POST"])
+def save_exp6():
+    import csv, datetime
+    data = request.get_json() or {}
+
+    # Support either a list of results (batch) or a single model result
+    results_list = data.get("results")
+    if results_list is None:
+        if "model" in data:
+            results_list = [data]
+        else:
+            return jsonify({"error": "Missing data"}), 400
+
+    csv_path = _get_experiment_csv_path("exp6_plan_evaluation.csv")
+    sidecar_path = _get_experiment_csv_path("exp6_plan_evaluation_runs.csv")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    session_id = data.get("session_id", datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+    evaluator_name = data.get("evaluator_name", "Human Evaluator")
+    image_name = data.get("image_name", "-")
+    destination = data.get("destination", "-")
+    days = data.get("days", "-")
+    budget = data.get("budget", "-")
+    travelers = data.get("travelers", "-")
+    pace = data.get("pace", "-")
+
+    rows_to_write = []
+    for idx, res in enumerate(results_list):
+        prompt_tok = int(res.get("prompt_tokens", 0) or 0)
+        comp_tok = int(res.get("completion_tokens", 0) or 0)
+        tot_tok = int(res.get("total_tokens", prompt_tok + comp_tok) or (prompt_tok + comp_tok))
+        m_name = res.get("model", f"m{idx+1}")
+        m_clean = str(m_name).replace("openai-", "").replace("anthropic-", "").replace("google-", "").replace("meta-", "")
+        req_id = res.get("request_id") or f"REQ-{session_id}-{m_clean}"
+
+        rows_to_write.append([
+            timestamp,
+            session_id,
+            req_id,
+            evaluator_name,
+            image_name,
+            destination,
+            days,
+            budget,
+            travelers,
+            pace,
+            res.get("model"),
+            res.get("model_label", res.get("model")),
+            res.get("gen_latency_ms", 0),
+            prompt_tok,
+            comp_tok,
+            tot_tok,
+            res.get("throughput_tps", 0),
+            res.get("total_score", 0),
+            res.get("dim1_score", 0),
+            res.get("dim2_score", 0),
+            res.get("dim3_score", 0),
+            res.get("dim4_score", 0),
+            res.get("dim5_score", 0),
+            res.get("criteria_scores_json", "{}"),
+            res.get("generated_plan_json", "[]"),
+        ])
+
+    header = [
+        "Timestamp", "Session ID", "Request ID", "Evaluator Name", "Image Name", "Destination",
+        "Days", "Budget", "Travelers", "Pace", "Model",
+        "Model Label", "Gen Latency MS", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Throughput TPS",
+        "Total Score", "Dim1_ConstraintSatisfaction", "Dim2_ActivityRelevance", "Dim3_Spatiality",
+        "Dim4_AccuracyValidity", "Dim5_OverallQuality", "CriteriaScoresJSON", "GeneratedPlanJSON"
+    ]
+
+    target_path = csv_path
+    try:
+        file_exists = os.path.exists(target_path)
+        with open(target_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerows(rows_to_write)
+        return jsonify({"status": "success", "saved_count": len(rows_to_write), "target": "main"})
+    except PermissionError:
+        # Fallback to sidecar if Excel or another program locks the main file
+        sidecar_exists = os.path.exists(sidecar_path)
+        with open(sidecar_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not sidecar_exists:
+                writer.writerow(header)
+            writer.writerows(rows_to_write)
+        return jsonify({"status": "success", "saved_count": len(rows_to_write), "target": "sidecar"})
+    except Exception as e:
+        print("Error saving exp6:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/experiment/results_exp6", methods=["GET"])
+def get_exp6_results():
+    import csv
+    csv_path = _get_experiment_csv_path("exp6_plan_evaluation.csv")
+    sidecar_path = _get_experiment_csv_path("exp6_plan_evaluation_runs.csv")
+
+    results = []
+    seen_req_keys = set()
+
+    for p in [csv_path, sidecar_path]:
+        if os.path.exists(p):
+            try:
+                with open(p, mode="r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for idx, row in enumerate(reader):
+                        r = dict(row)
+                        r.pop(None, None)
+                        m_clean = (r.get("Model") or "model").replace("openai-", "").replace("anthropic-", "").replace("google-", "").replace("meta-", "")
+                        req_id = r.get("Request ID") or r.get("request_id") or f"REQ-EXP6-{idx+1:03d}-{m_clean}"
+                        r["Request ID"] = req_id
+                        r["request_id"] = req_id
+                        p_tok = int(r.get("Prompt Tokens", 0) or 0)
+                        c_tok = int(r.get("Completion Tokens", 0) or 0)
+                        if not r.get("Total Tokens"):
+                            r["Total Tokens"] = p_tok + c_tok
+                        r["total_tokens"] = r["Total Tokens"]
+
+                        results.append(r)
+            except Exception as e:
+                print(f"Error reading {p}:", e)
+
+    return jsonify({"results": results})
+
+
+
+# --------------------
+# Blind Evaluation & Role Management Endpoints
+# --------------------
+import json
+import uuid
+import datetime
+
+parent_exp = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "experiment"))
+if os.path.isdir(parent_exp):
+    EXPERIMENT_DIR = parent_exp
+else:
+    EXPERIMENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "experiment"))
+os.makedirs(EXPERIMENT_DIR, exist_ok=True)
+
+BLIND_TRIPS_FILE = os.path.join(EXPERIMENT_DIR, "blind_trips.json")
+BLIND_EVALS_FILE = os.path.join(EXPERIMENT_DIR, "blind_evaluations.json")
+BLIND_COMPARISONS_FILE = os.path.join(EXPERIMENT_DIR, "blind_comparisons.json")
+USER_ROLES_FILE = os.path.join(EXPERIMENT_DIR, "user_roles.json")
+SYSTEM_SETTINGS_FILE = os.path.join(EXPERIMENT_DIR, "system_settings.json")
+
+def _load_json_file(filepath, default_val):
+    if not os.path.exists(filepath):
+        return default_val
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading {filepath}: {e}")
+        return default_val
+
+def _save_json_file(filepath, data):
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+@app.route("/blind_eval/save_trip", methods=["POST"])
+def save_blind_trip():
+    try:
+        data = request.get_json() or {}
+        scenario_id = (data.get("scenario_id") or "SC-DEFAULT").strip()
+        scenario_title = data.get("scenario_title") or scenario_id
+        scenario_notes = data.get("scenario_notes", "")
+        actual_model = data.get("actual_model", "gpt-4o")
+        itinerary = data.get("itinerary", [])
+        preferences = data.get("preferences", {})
+        typical_weather = data.get("typicalWeather")
+        suggestions = data.get("suggestions", [])
+        accommodations = data.get("accommodations", [])
+        uploaded_locations = data.get("uploaded_locations", [])
+
+        trips = _load_json_file(BLIND_TRIPS_FILE, [])
+        trip_id = f"trip_{uuid.uuid4().hex[:8]}"
+
+        new_trip = {
+            "id": trip_id,
+            "scenario_id": scenario_id,
+            "scenario_title": scenario_title,
+            "scenario_notes": scenario_notes,
+            "actual_model": actual_model,
+            "itinerary": itinerary,
+            "preferences": preferences,
+            "typicalWeather": typical_weather,
+            "suggestions": suggestions,
+            "accommodations": accommodations,
+            "uploaded_locations": uploaded_locations,
+            "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        trips.append(new_trip)
+        _save_json_file(BLIND_TRIPS_FILE, trips)
+
+        return jsonify({"status": "success", "trip_id": trip_id, "scenario_id": scenario_id})
+    except Exception as e:
+        print("[Error /blind_eval/save_trip]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/blind_eval/trips", methods=["GET"])
+def get_blind_trips():
+    try:
+        user_role = request.args.get("role", "user")
+        raw_trips = _load_json_file(BLIND_TRIPS_FILE, [])
+
+        # Group by scenario to assign deterministic blind labels (แผน A, แผน B, etc.)
+        scenario_map = {}
+        for t in raw_trips:
+            sc_id = t.get("scenario_id", "SC-DEFAULT")
+            scenario_map.setdefault(sc_id, []).append(t)
+
+        labeled_trips = []
+        for sc_id, group in scenario_map.items():
+            # Sort group by created_at or id for deterministic labeling
+            sorted_group = sorted(group, key=lambda x: x.get("created_at", x.get("id")))
+            for idx, item in enumerate(sorted_group):
+                trip_copy = dict(item)
+                blind_label = f"แผน {chr(65 + idx)}"  # แผน A, แผน B, แผน C
+                trip_copy["blind_label"] = blind_label
+
+                # Hide actual model unless user is dev
+                if user_role != "dev":
+                    trip_copy.pop("actual_model", None)
+
+                labeled_trips.append(trip_copy)
+
+        return jsonify({"trips": labeled_trips})
+    except Exception as e:
+        print("[Error /blind_eval/trips]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/blind_eval/trip/<trip_id>", methods=["DELETE"])
+def delete_blind_trip(trip_id):
+    try:
+        trips = _load_json_file(BLIND_TRIPS_FILE, [])
+        trips = [t for t in trips if t.get("id") != trip_id]
+        _save_json_file(BLIND_TRIPS_FILE, trips)
+
+        # Also clean up any evaluations referencing this trip
+        evals = _load_json_file(BLIND_EVALS_FILE, [])
+        new_evals = [e for e in evals if e.get("trip_id") != trip_id]
+        if len(new_evals) != len(evals):
+            _save_json_file(BLIND_EVALS_FILE, new_evals)
+
+        return jsonify({"status": "deleted", "trip_id": trip_id})
+    except Exception as e:
+        print("[Error /blind_eval/trip delete]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/blind_eval/submit_score", methods=["POST"])
+def submit_blind_score():
+    try:
+        data = request.get_json() or {}
+        scenario_id = data.get("scenario_id")
+        trip_id = data.get("trip_id")
+        blind_label = data.get("blind_label")
+        expert_id = data.get("expert_id", "anonymous_expert")
+        expert_name = data.get("expert_name", "Anonymous Expert")
+        expert_profile = data.get("expert_profile", {})
+        detailed_scores = data.get("detailed_scores") or {}
+        scores = data.get("scores") or {}
+        overall_pick = data.get("overall_pick", False)
+        feedback = data.get("feedback", "")
+
+        if not scenario_id or not trip_id:
+            return jsonify({"error": "Missing scenario_id or trip_id"}), 400
+
+        # Retrieve actual model for background audit (hidden from response)
+        trips = _load_json_file(BLIND_TRIPS_FILE, [])
+        matched_trip = next((t for t in trips if t.get("id") == trip_id), None)
+        actual_model = matched_trip.get("actual_model", "unknown") if matched_trip else "unknown"
+
+        # Calculate dimension averages from detailed_scores if present
+        fa_avg = float(detailed_scores.get("fa_avg", 0)) or (
+            sum([int(detailed_scores.get(f"fa{i}", 3)) for i in range(1, 6)]) / 5.0
+            if "fa1" in detailed_scores else float(scores.get("information_accuracy", 3))
+        )
+        cc_avg = float(detailed_scores.get("cc_avg", 0)) or (
+            sum([int(detailed_scores.get(f"cc{i}", 3)) for i in range(1, 6)]) / 5.0
+            if "cc1" in detailed_scores else float(scores.get("persona_alignment", 3))
+        )
+        pf_avg = float(detailed_scores.get("pf_avg", 0)) or (
+            sum([int(detailed_scores.get(f"pf{i}", 3)) for i in range(1, 6)]) / 5.0
+            if "pf1" in detailed_scores else float(scores.get("temporal_pacing", 3))
+        )
+        sr_avg = float(detailed_scores.get("sr_avg", 0)) or (
+            sum([int(detailed_scores.get(f"sr{i}", 3)) for i in range(1, 5)]) / 4.0
+            if "sr1" in detailed_scores else float(scores.get("spatial_feasibility", 3))
+        )
+        de_avg = float(detailed_scores.get("de_avg", 0)) or (
+            sum([int(detailed_scores.get(f"de{i}", 3)) for i in range(1, 6)]) / 5.0
+            if "de1" in detailed_scores else float(scores.get("attraction_quality", 3))
+        )
+        ru_avg = float(detailed_scores.get("ru_avg", 0)) or (
+            sum([int(detailed_scores.get(f"ru{i}", 3)) for i in range(1, 5)]) / 4.0
+            if "ru1" in detailed_scores else 3.0
+        )
+
+        overall_percentage = detailed_scores.get("overall_percentage", 75)
+        strengths = detailed_scores.get("strengths", "")
+        weaknesses = detailed_scores.get("weaknesses", "")
+        priority_improvement = detailed_scores.get("priority_improvement", "")
+        priority_improvement_other = detailed_scores.get("priority_improvement_other", "")
+
+        geo_fam = data.get("geographic_familiarity") or detailed_scores.get("geographic_familiarity") or expert_profile.get("geographic_familiarity") or 3
+        vis_align = data.get("vision_alignment") or detailed_scores.get("vision_alignment") or detailed_scores.get("cc6") or 4
+
+        evals = _load_json_file(BLIND_EVALS_FILE, [])
+        eval_id = f"eval_{uuid.uuid4().hex[:8]}"
+
+        new_eval = {
+            "id": eval_id,
+            "scenario_id": scenario_id,
+            "trip_id": trip_id,
+            "blind_label": blind_label,
+            "actual_model": actual_model,
+            "expert_id": expert_id,
+            "expert_name": expert_name,
+            "geographic_familiarity": geo_fam,
+            "vision_alignment": vis_align,
+            "expert_profile": {
+                **expert_profile,
+                "geographic_familiarity": geo_fam,
+            },
+            "scores": {
+                "spatial_feasibility": round(sr_avg),
+                "temporal_pacing": round(pf_avg),
+                "persona_alignment": round(cc_avg),
+                "attraction_quality": round(de_avg),
+                "information_accuracy": round(fa_avg),
+                "vision_alignment": vis_align,
+                "geographic_familiarity": geo_fam,
+            },
+            "detailed_scores": {
+                **detailed_scores,
+                "fa_avg": round(fa_avg, 2),
+                "cc_avg": round(cc_avg, 2),
+                "pf_avg": round(pf_avg, 2),
+                "sr_avg": round(sr_avg, 2),
+                "de_avg": round(de_avg, 2),
+                "ru_avg": round(ru_avg, 2),
+                "cc6": detailed_scores.get("cc6", vis_align),
+                "vision_alignment": vis_align,
+                "geographic_familiarity": geo_fam,
+                "overall_percentage": overall_percentage,
+                "strengths": strengths,
+                "weaknesses": weaknesses,
+                "priority_improvement": priority_improvement,
+                "priority_improvement_other": priority_improvement_other,
+            },
+            "overall_pick": bool(overall_pick),
+            "feedback": feedback or strengths or weaknesses,
+            "submitted_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        evals.append(new_eval)
+        _save_json_file(BLIND_EVALS_FILE, evals)
+
+        return jsonify({"status": "success", "eval_id": eval_id})
+    except Exception as e:
+        print("[Error /blind_eval/submit_score]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/blind_eval/submit_comparison", methods=["POST"])
+def submit_blind_comparison():
+    try:
+        data = request.get_json() or {}
+        scenario_id = data.get("scenario_id")
+        if not scenario_id:
+            return jsonify({"error": "Missing scenario_id"}), 400
+
+        comparisons = _load_json_file(BLIND_COMPARISONS_FILE, [])
+        comp_id = f"comp_{uuid.uuid4().hex[:8]}"
+
+        expert_profile = data.get("expert_profile", {})
+        geo_fam = data.get("geographic_familiarity") or expert_profile.get("geographic_familiarity") or 3
+
+        new_comp = {
+            "id": comp_id,
+            "scenario_id": scenario_id,
+            "expert_id": data.get("expert_id", "anonymous_expert"),
+            "expert_name": data.get("expert_name", "Anonymous Expert"),
+            "geographic_familiarity": geo_fam,
+            "expert_profile": {
+                **expert_profile,
+                "geographic_familiarity": geo_fam,
+            },
+            "qualitative_feedback": data.get("qualitative_feedback", {}),
+            "submitted_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        comparisons.append(new_comp)
+        _save_json_file(BLIND_COMPARISONS_FILE, comparisons)
+
+        return jsonify({"status": "success", "comparison_id": comp_id})
+    except Exception as e:
+        print("[Error /blind_eval/submit_comparison]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/blind_eval/results", methods=["GET"])
+def get_blind_results():
+    try:
+        evals = _load_json_file(BLIND_EVALS_FILE, [])
+        trips = _load_json_file(BLIND_TRIPS_FILE, [])
+        comparisons = _load_json_file(BLIND_COMPARISONS_FILE, [])
+
+        # Build comparison scenario familiarity map
+        comp_geo_map = {}
+        for c in comparisons:
+            eid = (c.get("expert_id") or "").strip().lower()
+            sid = (c.get("scenario_id") or "").strip()
+            g = c.get("geographic_familiarity") or c.get("expert_profile", {}).get("geographic_familiarity")
+            if eid and sid and g:
+                try:
+                    comp_geo_map[f"{eid}_{sid}"] = int(g)
+                except (ValueError, TypeError):
+                    pass
+
+        # Cross-reference with evals
+        for ev in evals:
+            eid = (ev.get("expert_id") or "").strip().lower()
+            sid = (ev.get("scenario_id") or "").strip()
+            if f"{eid}_{sid}" in comp_geo_map:
+                ev["geographic_familiarity"] = comp_geo_map[f"{eid}_{sid}"]
+                if "detailed_scores" in ev and isinstance(ev["detailed_scores"], dict):
+                    ev["detailed_scores"]["geographic_familiarity"] = comp_geo_map[f"{eid}_{sid}"]
+                if "expert_profile" in ev and isinstance(ev["expert_profile"], dict):
+                    ev["expert_profile"]["geographic_familiarity"] = comp_geo_map[f"{eid}_{sid}"]
+                if "scores" in ev and isinstance(ev["scores"], dict):
+                    ev["scores"]["geographic_familiarity"] = comp_geo_map[f"{eid}_{sid}"]
+
+        # Compute summary stats per model
+        model_stats = {}
+        for ev in evals:
+            m = ev.get("actual_model", "unknown")
+            if m not in model_stats:
+                model_stats[m] = {
+                    "model": m,
+                    "count": 0,
+                    "total_spatial": 0,
+                    "total_temporal": 0,
+                    "total_persona": 0,
+                    "total_attraction": 0,
+                    "total_accuracy": 0,
+                    "total_fa": 0,
+                    "total_cc": 0,
+                    "total_pf": 0,
+                    "total_sr": 0,
+                    "total_de": 0,
+                    "total_ru": 0,
+                    "total_percentage": 0,
+                    "total_overall": 0,
+                    "wins": 0,
+                }
+            sc = ev.get("scores", {})
+            det = ev.get("detailed_scores", {})
+            st = model_stats[m]
+            st["count"] += 1
+            st["total_spatial"] += sc.get("spatial_feasibility", 0)
+            st["total_temporal"] += sc.get("temporal_pacing", 0)
+            st["total_persona"] += sc.get("persona_alignment", 0)
+            st["total_attraction"] += sc.get("attraction_quality", 0)
+            st["total_accuracy"] += sc.get("information_accuracy", 0)
+
+            # Detailed 6 dimensions
+            fa_val = float(det.get("fa_avg", sc.get("information_accuracy", 3)))
+            cc_val = float(det.get("cc_avg", sc.get("persona_alignment", 3)))
+            pf_val = float(det.get("pf_avg", sc.get("temporal_pacing", 3)))
+            sr_val = float(det.get("sr_avg", sc.get("spatial_feasibility", 3)))
+            de_val = float(det.get("de_avg", sc.get("attraction_quality", 3)))
+            ru_val = float(det.get("ru_avg", 3.5))
+            pct_val = float(det.get("overall_percentage", 70))
+
+            st["total_fa"] += fa_val
+            st["total_cc"] += cc_val
+            st["total_pf"] += pf_val
+            st["total_sr"] += sr_val
+            st["total_de"] += de_val
+            st["total_ru"] += ru_val
+            st["total_percentage"] += pct_val
+
+            avg_6 = (fa_val + cc_val + pf_val + sr_val + de_val + ru_val) / 6.0
+            st["total_overall"] += avg_6
+            if ev.get("overall_pick"):
+                st["wins"] += 1
+
+        summary = []
+        for m, st in model_stats.items():
+            c = st["count"] or 1
+            summary.append({
+                "model": m,
+                "evaluations_count": st["count"],
+                "avg_spatial": round(st["total_spatial"] / c, 2),
+                "avg_temporal": round(st["total_temporal"] / c, 2),
+                "avg_persona": round(st["total_persona"] / c, 2),
+                "avg_attraction": round(st["total_attraction"] / c, 2),
+                "avg_accuracy": round(st["total_accuracy"] / c, 2),
+                "avg_fa": round(st["total_fa"] / c, 2),
+                "avg_cc": round(st["total_cc"] / c, 2),
+                "avg_pf": round(st["total_pf"] / c, 2),
+                "avg_sr": round(st["total_sr"] / c, 2),
+                "avg_de": round(st["total_de"] / c, 2),
+                "avg_ru": round(st["total_ru"] / c, 2),
+                "avg_overall_percentage": round(st["total_percentage"] / c, 1),
+                "overall_score": round(st["total_overall"] / c, 2),
+                "total_wins": st["wins"],
+                "win_rate_percent": round((st["wins"] / c) * 100, 1)
+            })
+
+        return jsonify({
+            "evaluations": evals,
+            "comparisons": comparisons,
+            "summary": summary,
+            "total_trips": len(trips)
+        })
+    except Exception as e:
+        print("[Error /blind_eval/results]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/blind_eval/clear_results", methods=["POST"])
+def clear_blind_results():
+    """
+    Dev-only: Clears test evaluation scores and qualitative feedback.
+    Preserves blind_trips.json (benchmark scenario trips) intact!
+    """
+    try:
+        data = request.get_json() or {}
+        role = (data.get("role") or "").strip().lower()
+        if role != "dev":
+            return jsonify({"error": "Unauthorized. Only 'dev' role can clear evaluation data."}), 403
+
+        target = data.get("target", "all")  # "all" or "expert"
+        expert_id = (data.get("expert_id") or "").strip().lower()
+
+        evals = _load_json_file(BLIND_EVALS_FILE, [])
+        comparisons = _load_json_file(BLIND_COMPARISONS_FILE, [])
+
+        initial_eval_count = len(evals)
+        initial_comp_count = len(comparisons)
+
+        if target == "expert" and expert_id:
+            # Filter out evaluations and comparisons by this specific expert
+            new_evals = [
+                e for e in evals
+                if (e.get("expert_id") or "").strip().lower() != expert_id
+            ]
+            new_comps = [
+                c for c in comparisons
+                if (c.get("expert_id") or "").strip().lower() != expert_id
+            ]
+            deleted_evals = initial_eval_count - len(new_evals)
+            deleted_comps = initial_comp_count - len(new_comps)
+
+            _save_json_file(BLIND_EVALS_FILE, new_evals)
+            _save_json_file(BLIND_COMPARISONS_FILE, new_comps)
+
+            return jsonify({
+                "status": "success",
+                "target": "expert",
+                "expert_id": expert_id,
+                "deleted_evals": deleted_evals,
+                "deleted_comps": deleted_comps,
+                "remaining_evals": len(new_evals),
+                "remaining_comps": len(new_comps)
+            })
+        else:
+            # Clear all evaluations and comparisons (preserve blind_trips.json!)
+            _save_json_file(BLIND_EVALS_FILE, [])
+            _save_json_file(BLIND_COMPARISONS_FILE, [])
+
+            return jsonify({
+                "status": "success",
+                "target": "all",
+                "deleted_evals": initial_eval_count,
+                "deleted_comps": initial_comp_count,
+                "remaining_evals": 0,
+                "remaining_comps": 0
+            })
+    except Exception as e:
+        print("[Error /blind_eval/clear_results]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/blind_eval/evaluation/<eval_id>", methods=["DELETE"])
+def delete_blind_evaluation(eval_id):
+    """
+    Dev-only: Delete a single evaluation record by its id.
+    """
+    try:
+        evals = _load_json_file(BLIND_EVALS_FILE, [])
+        new_evals = [e for e in evals if e.get("id") != eval_id]
+        if len(new_evals) == len(evals):
+            return jsonify({"error": "Evaluation not found"}), 404
+        _save_json_file(BLIND_EVALS_FILE, new_evals)
+        return jsonify({"status": "deleted", "eval_id": eval_id})
+    except Exception as e:
+        print("[Error /blind_eval/evaluation delete]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route("/users/roles", methods=["GET", "POST"])
+def manage_user_roles():
+    try:
+        # Default initial roles if file is missing
+        default_roles = {
+            "dev@pixinerary.com": {
+                "email": "dev@pixinerary.com",
+                "role": "dev",
+                "name": "Developer Admin",
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            },
+            "expert@pixinerary.com": {
+                "email": "expert@pixinerary.com",
+                "role": "expert",
+                "name": "Tourism Expert",
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            },
+            "user@pixinerary.com": {
+                "email": "user@pixinerary.com",
+                "role": "user",
+                "name": "General Traveler",
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        }
+        roles = _load_json_file(USER_ROLES_FILE, default_roles)
+        settings = _load_json_file(SYSTEM_SETTINGS_FILE, {"default_role": "expert"})
+
+        if request.method == "POST":
+            data = request.get_json() or {}
+
+            # Support updating default_role via /users/roles payload
+            if "default_role" in data and not data.get("email"):
+                new_def_role = (data.get("default_role") or "expert").strip().lower()
+                if new_def_role in ["dev", "expert", "user"]:
+                    settings["default_role"] = new_def_role
+                    settings["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _save_json_file(SYSTEM_SETTINGS_FILE, settings)
+                    return jsonify({"status": "success", "default_role": new_def_role})
+                return jsonify({"error": "Invalid role"}), 400
+
+            email = (data.get("email") or "").strip().lower()
+            role = (data.get("role") or settings.get("default_role", "expert")).strip().lower()
+            name = (data.get("name") or email.split("@")[0]).strip()
+
+            if not email:
+                return jsonify({"error": "Email is required"}), 400
+            if role not in ["dev", "expert", "user"]:
+                return jsonify({"error": "Invalid role. Must be 'dev', 'expert', or 'user'"}), 400
+
+            roles[email] = {
+                "email": email,
+                "role": role,
+                "name": name,
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            _save_json_file(USER_ROLES_FILE, roles)
+            return jsonify({
+                "status": "success",
+                "user": roles[email],
+                "default_role": settings.get("default_role", "expert")
+            })
+
+        # GET request returns list of users & current default_role
+        user_list = [v for k, v in roles.items() if not k.startswith("__")]
+        return jsonify({
+            "users": user_list,
+            "default_role": settings.get("default_role", "expert")
+        })
+    except Exception as e:
+        print("[Error /users/roles]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/system/default_role", methods=["GET", "POST"])
+def manage_default_role():
+    try:
+        settings = _load_json_file(SYSTEM_SETTINGS_FILE, {"default_role": "expert"})
+        if request.method == "POST":
+            data = request.get_json() or {}
+            new_role = (data.get("default_role") or data.get("role") or "expert").strip().lower()
+            if new_role not in ["dev", "expert", "user"]:
+                return jsonify({"error": "Invalid role. Must be 'dev', 'expert', or 'user'"}), 400
+            settings["default_role"] = new_role
+            settings["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _save_json_file(SYSTEM_SETTINGS_FILE, settings)
+            return jsonify({"status": "success", "default_role": new_role})
+
+        return jsonify({"default_role": settings.get("default_role", "expert")})
+    except Exception as e:
+        print("[Error /system/default_role]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/users/batch_role", methods=["POST"])
+def batch_update_user_roles():
+    try:
+        data = request.get_json() or {}
+        from_role = (data.get("from_role") or "user").strip().lower()
+        to_role = (data.get("to_role") or "expert").strip().lower()
+        if to_role not in ["dev", "expert", "user"] or from_role not in ["dev", "expert", "user"]:
+            return jsonify({"error": "Invalid roles"}), 400
+
+        roles = _load_json_file(USER_ROLES_FILE, {})
+        updated_count = 0
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for email, u in roles.items():
+            if not email.startswith("__") and u.get("role") == from_role:
+                u["role"] = to_role
+                u["updated_at"] = now_str
+                updated_count += 1
+        _save_json_file(USER_ROLES_FILE, roles)
+        return jsonify({"status": "success", "updated_count": updated_count})
+    except Exception as e:
+        print("[Error /users/batch_role]:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------
+# Railway entrypoint
+# --------------------
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting server on port {port}")
+
+    # Warm up CLIP model in background thread to avoid blocking port binding and healthchecks
+    threading.Thread(target=load_model, daemon=True).start()
+
+    # threaded=True allows Flask to handle concurrent requests without blocking
+    app.run(host="0.0.0.0", port=port, threaded=True)

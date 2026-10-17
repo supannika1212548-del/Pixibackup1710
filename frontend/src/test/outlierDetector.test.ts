@@ -1,0 +1,424 @@
+import { describe, it, expect } from "vitest";
+import { detectVisionOutliers, type GeoVisionResult } from "@/utils/outlierDetector";
+
+describe("Vision AI Outlier Detection & Geo-Distance Rules", () => {
+  it("should keep neighboring province excursions (50-70 km) and mark them as excursions", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Grand Palace",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.85,
+        lat: 13.7500,
+        lng: 100.4913,
+        similar_locations: [],
+      },
+      {
+        place: "Wat Arun",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.82,
+        lat: 13.7437,
+        lng: 100.4888,
+        similar_locations: [],
+      },
+      {
+        place: "Wat Mahathat Ayutthaya", // ~65 km north of Bangkok
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.78,
+        lat: 14.3569,
+        lng: 100.5678,
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true, 70, 35);
+
+    expect(outliers.length).toBe(0);
+    expect(kept.length).toBe(3);
+
+    const ayutthaya = kept.find((k) => k.place.includes("Ayutthaya"));
+    expect(ayutthaya).toBeDefined();
+    expect(ayutthaya!.isExcursion).toBe(true);
+    expect(ayutthaya!.distanceKm).toBeGreaterThanOrEqual(50);
+    expect(ayutthaya!.distanceKm).toBeLessThanOrEqual(70);
+  });
+
+  it("should flag distant places (> 70 km) as DISTANCE_EXCEEDED outliers", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Grand Palace",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.85,
+        lat: 13.7500,
+        lng: 100.4913,
+        similar_locations: [],
+      },
+      {
+        place: "Wat Phra Kaew",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.88,
+        lat: 13.7510,
+        lng: 100.4920,
+        similar_locations: [],
+      },
+      {
+        place: "Wat Phra Singh (Chiang Mai)", // ~680 km north
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.80,
+        lat: 18.7885,
+        lng: 98.9817,
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true, 70, 35);
+
+    expect(kept.length).toBe(2);
+    expect(outliers.length).toBe(1);
+
+    const chiangMaiOutlier = outliers[0];
+    expect(chiangMaiOutlier.category).toBe("DISTANCE_EXCEEDED");
+    expect(chiangMaiOutlier.distanceKm).toBeGreaterThan(500);
+    expect(chiangMaiOutlier.canRestore).toBe(true);
+  });
+
+  it("should flag places > 55 km (e.g. Chon Buri / Bang Saen ~68 km) as DISTANCE_EXCEEDED with default 55 km threshold", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Grand Palace",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.85,
+        lat: 13.7500,
+        lng: 100.4913,
+        similar_locations: [],
+      },
+      {
+        place: "Wat Pho",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.88,
+        lat: 13.7466,
+        lng: 100.4930,
+        similar_locations: [],
+      },
+      {
+        place: "Bang Saen Beach (Chon Buri)", // ~68 km south-east of Bangkok
+        country: "Thailand",
+        type: "nature",
+        confidence: 0.82,
+        lat: 13.2830,
+        lng: 100.9150,
+        similar_locations: [],
+      },
+    ];
+
+    // Using default threshold (55 km)
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(2);
+    expect(outliers.length).toBe(1);
+
+    const chonBuriOutlier = outliers[0];
+    expect(chonBuriOutlier.category).toBe("DISTANCE_EXCEEDED");
+    expect(chonBuriOutlier.distanceKm).toBeGreaterThan(55);
+    expect(chonBuriOutlier.distanceKm).toBeLessThan(100);
+    expect(chonBuriOutlier.canRestore).toBe(true);
+  });
+
+  it("should detect country mismatch outliers", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Tokyo Tower",
+        country: "Japan",
+        type: "attraction",
+        confidence: 0.90,
+        similar_locations: [],
+      },
+      {
+        place: "Senso-ji Temple",
+        country: "Japan",
+        type: "culture",
+        confidence: 0.85,
+        similar_locations: [],
+      },
+      {
+        place: "Eiffel Tower",
+        country: "France",
+        type: "attraction",
+        confidence: 0.92,
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(2);
+    expect(outliers.length).toBe(1);
+    expect(outliers[0].category).toBe("COUNTRY_MISMATCH");
+    expect(outliers[0].place).toBe("Eiffel Tower");
+  });
+
+  it("should detect non-travel image outliers", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Tokyo Tower",
+        country: "Japan",
+        type: "attraction",
+        confidence: 0.90,
+        similar_locations: [],
+      },
+      {
+        place: "Unknown Object",
+        country: "Japan",
+        type: "receipt",
+        confidence: 0.10,
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(1);
+    expect(outliers.length).toBe(1);
+    expect(outliers[0].category).toBe("NON_TRAVEL");
+  });
+
+  it("should detect portrait_selfie and is_identifiable_place=false as NON_TRAVEL with custom rejection reason", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Wat Phra Kaew",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.92,
+        lat: 13.7510,
+        lng: 100.4920,
+        similar_locations: [],
+      },
+      {
+        place: "ภาพไม่ระบุสถานที่ท่องเที่ยว",
+        country: "-",
+        type: "portrait_selfie",
+        confidence: 0,
+        is_identifiable_place: false,
+        rejection_reason: "ภาพนี้เป็นภาพถ่ายบุคคล (Selfie) ไม่สามารถระบุแลนด์มาร์กได้",
+        similar_locations: [],
+      },
+      {
+        place: "ภาพไม่ระบุสถานที่ท่องเที่ยว",
+        country: "-",
+        type: "document_screenshot",
+        confidence: 0,
+        is_identifiable_place: false,
+        rejection_reason: "ภาพนี้เป็นเอกสารหรือสลิป ไม่ใช่สถานที่ท่องเที่ยว",
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(1);
+    expect(outliers.length).toBe(2);
+    expect(outliers[0].category).toBe("NON_TRAVEL");
+    expect(outliers[0].reasonDescription).toContain("Selfie");
+    expect(outliers[1].category).toBe("NON_TRAVEL");
+    expect(outliers[1].reasonDescription).toContain("เอกสาร");
+  });
+
+  it("should not salvage non-travel images into kept when all uploads are non-travel", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "ภาพไม่ระบุสถานที่ท่องเที่ยว",
+        country: "-",
+        type: "portrait_selfie",
+        confidence: 0,
+        is_identifiable_place: false,
+        rejection_reason: "ภาพบุคคล",
+        similar_locations: [],
+      },
+      {
+        place: "ภาพไม่ระบุสถานที่ท่องเที่ยว",
+        country: "-",
+        type: "document",
+        confidence: 0,
+        is_identifiable_place: false,
+        rejection_reason: "สลิปโอนเงิน",
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(0);
+    expect(outliers.length).toBe(2);
+    expect(outliers[0].category).toBe("NON_TRAVEL");
+    expect(outliers[1].category).toBe("NON_TRAVEL");
+  });
+
+  it("should keep valid travel destinations captured as screenshots (Exp2 UGC & Screenshot Support)", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Omoide Yokocho",
+        country: "Japan",
+        type: "screenshot", // Model tagged as screenshot, but is_identifiable_place is true
+        confidence: 0.88,
+        is_identifiable_place: true,
+        lat: 35.6931,
+        lng: 139.7001,
+        similar_locations: [],
+      },
+      {
+        place: "Shibuya Crossing",
+        country: "Japan",
+        type: "landmark",
+        confidence: 0.95,
+        is_identifiable_place: true,
+        lat: 35.6595,
+        lng: 139.7004,
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(outliers.length).toBe(0);
+    expect(kept.length).toBe(2);
+    const omoide = kept.find((k) => k.place === "Omoide Yokocho");
+    expect(omoide).toBeDefined();
+    expect(omoide!.type).toBe("landmark"); // normalized from screenshot
+  });
+
+  it("should flag pure non-travel screenshots (chats, settings) as NON_TRAVEL outliers", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Wat Arun",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.89,
+        lat: 13.7437,
+        lng: 100.4888,
+        similar_locations: [],
+      },
+      {
+        place: "ภาพไม่ระบุสถานที่ (ภาพแคปหน้าจอแชท / ระบบที่ไม่มีสถานที่ท่องเที่ยว)",
+        country: "-",
+        type: "screenshot",
+        confidence: 0,
+        is_identifiable_place: false,
+        non_travel_category: "screenshot",
+        rejection_reason: "ภาพนี้เป็นภาพบันทึกหน้าจอแชท ไม่ใช่สถานที่ท่องเที่ยว",
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(1);
+    expect(outliers.length).toBe(1);
+    expect(outliers[0].category).toBe("NON_TRAVEL");
+    expect(outliers[0].reasonTitle).toContain("ภาพแคปหน้าจอ");
+  });
+
+  it("should detect low visual confidence outliers", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Tokyo Tower",
+        country: "Japan",
+        type: "attraction",
+        confidence: 0.90,
+        similar_locations: [],
+      },
+      {
+        place: "Blurry Park",
+        country: "Japan",
+        type: "nature",
+        confidence: 0.12, // < 20%
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(1);
+    expect(outliers.length).toBe(1);
+    expect(outliers[0].category).toBe("LOW_CONFIDENCE");
+  });
+
+  it("should detect duplicate places within the same trip", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Tokyo Tower",
+        country: "Japan",
+        type: "attraction",
+        confidence: 0.90,
+        similar_locations: [],
+      },
+      {
+        place: "Tokyo Tower",
+        country: "Japan",
+        type: "attraction",
+        confidence: 0.88,
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(1);
+    expect(outliers.length).toBe(1);
+    expect(outliers[0].category).toBe("DUPLICATE");
+  });
+
+  it("should preserve detailed non-travel attributes (detected_content, detailed_description, suggested_action, non_travel_category)", () => {
+    const results: GeoVisionResult[] = [
+      {
+        place: "Wat Arun",
+        country: "Thailand",
+        type: "culture",
+        confidence: 0.95,
+        similar_locations: [],
+      },
+      {
+        place: "ภาพไม่ระบุสถานที่ (รูปถ่ายอาหารจานเดียว (ต้มยำกุ้ง))",
+        country: "-",
+        type: "food_dish",
+        confidence: 0,
+        is_identifiable_place: false,
+        detected_content: "รูปถ่ายอาหารจานเดียว (ต้มยำกุ้ง)",
+        detailed_description: "ภาพนี้แสดงชามต้มยำกุ้งในระยะใกล้ ไม่มีองค์ประกอบทิวทัศน์ที่ระบุสถานที่ได้",
+        suggested_action: "กรุณาอัปโหลดภาพหน้าร้านหรือวิวสถานที่ท่องเที่ยวแทน",
+        non_travel_category: "food_dish",
+        similar_locations: [],
+      },
+      {
+        place: "ภาพไม่ระบุสถานที่",
+        country: "-",
+        type: "pet",
+        confidence: 0,
+        is_identifiable_place: false,
+        similar_locations: [],
+      },
+    ];
+
+    const { kept, outliers } = detectVisionOutliers(results, true);
+
+    expect(kept.length).toBe(1);
+    expect(outliers.length).toBe(2);
+
+    const foodOutlier = outliers.find(o => o.non_travel_category === "food_dish");
+    expect(foodOutlier).toBeDefined();
+    expect(foodOutlier?.reasonTitle).toContain("รูปถ่ายอาหารจานเดียว");
+    expect(foodOutlier?.detailed_description).toContain("ต้มยำกุ้ง");
+    expect(foodOutlier?.suggested_action).toContain("หน้าร้าน");
+
+    const petOutlier = outliers.find(o => o.non_travel_category === "pet");
+    expect(petOutlier).toBeDefined();
+    expect(petOutlier?.reasonTitle).toContain("สัตว์เลี้ยง");
+  });
+});
+

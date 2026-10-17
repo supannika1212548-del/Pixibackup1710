@@ -1,0 +1,7 @@
+﻿Model,Model Label,Constraint Compliance,Activity Relevance,Spatial Feasibility,Accuracy & Validity,Overall Quality,Total_Score,Latency_Mean_MS,Latency_Std_MS,Latency_Mean_Sec,Plan_Count
+anthropic-claude-sonnet5,Claude Sonnet 5,3.733,3.646,3.729,3.916,3.854,3.777,264797.25,27664.811,264.797,12
+openai-gpt-54,GPT-5.4,3.417,3.625,3.354,3.665,3.438,3.502,152527.083,29203.709,152.527,12
+google-gemini-38-flash,Gemini 3.8 Flash,3.25,3.458,3.271,3.722,3.5,3.44,204000.25,50748.26,204.0,12
+qwen-25-vl-72b,Qwen 2.5 VL 72B,3.333,3.208,2.875,3.693,2.812,3.186,522627.0,120760.545,522.627,12
+openai-gpt-54-mini,GPT-5.4 Mini,2.933,3.229,3.021,3.722,3.0,3.182,67795.083,21402.854,67.795,12
+meta-llama4,Llama 4 Maverick,3.2,2.896,3.312,3.778,2.646,3.166,277868.667,182600.434,277.869,12

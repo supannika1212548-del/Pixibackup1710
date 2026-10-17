@@ -1,0 +1,778 @@
+import { useState, useCallback } from "react";
+import { BedDouble, Plus, Globe, Star, Phone, MapPin, RefreshCw, ExternalLink, Building2, Clock, Search, ChevronUp, Sparkles } from "lucide-react";
+import { useDraggable } from "@dnd-kit/core";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
+import { type SuggestedPlace } from "@/components/AISuggestedPlaces";
+import { buildBookingUrl, buildAgodaUrl } from "@/lib/hotelUrl";
+import { HotelSelectCombobox } from "@/components/HotelSelectCombobox";
+import { getCuratedFallbackPhoto } from "@/services/photoService";
+import { useLanguage } from "@/context/LanguageContext";
+
+export const TIME_OPTIONS_24H = Array.from({ length: 48 }, (_, i) => {
+  const hours = Math.floor(i / 2).toString().padStart(2, "0");
+  const minutes = i % 2 === 0 ? "00" : "30";
+  return `${hours}:${minutes}`;
+});
+
+// ─────────────────────────────────────────
+// Draggable Hotel Card
+// ─────────────────────────────────────────
+interface DraggableHotelCardProps {
+  hotel: SuggestedPlace & { rating?: number | null; website?: string | null; phoneNumber?: string | null; priceLevel?: number | null };
+  onAdd?: (hotel: SuggestedPlace, checkInDay: number, checkInTime: string, checkOutDay: number, checkOutTime: string) => void;
+  daysCount: number;
+  cityName?: string;
+  checkInDate?: string;
+  checkOutDate?: string;
+}
+
+const DraggableHotelCard = ({ hotel, onAdd, daysCount, cityName = "", checkInDate, checkOutDate }: DraggableHotelCardProps) => {
+  const { language, locPlace, locDesc } = useLanguage();
+  const [checkInDay, setCheckInDay] = useState<string>("0");
+  const [checkInTime, setCheckInTime] = useState<string>("15:00");
+  const [checkOutDay, setCheckOutDay] = useState<string>((daysCount > 0 ? daysCount - 1 : 0).toString());
+  const [checkOutTime, setCheckOutTime] = useState<string>("11:00");
+  const [isPopoverOpen, setIsPopoverOpen] = useState(false);
+
+  const checkInTimes = TIME_OPTIONS_24H;
+  const checkOutTimes = TIME_OPTIONS_24H;
+
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `hotel-suggestion-${hotel.id}`,
+    data: { type: "hotel-suggestion", place: hotel },
+  });
+
+  const priceLabel = hotel.priceLevel != null
+    ? (["Free", "$", "$$", "$$$", "$$$$"][hotel.priceLevel] ?? "$")
+    : null;
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`group relative min-w-[280px] sm:min-w-[300px] max-w-[340px] rounded-2xl overflow-hidden bg-card border border-border shadow-sm hover:shadow-lg transition-all duration-300 snap-start cursor-grab active:cursor-grabbing select-none ${
+        isDragging ? "opacity-30 scale-95" : "hover:-translate-y-1"
+      }`}
+      {...attributes}
+      {...listeners}
+    >
+      {/* Hotel Image */}
+      <div className="relative h-40 overflow-hidden">
+        <img
+          src={hotel.image_url || getCuratedFallbackPhoto("hotel", hotel.name)}
+          alt={hotel.name}
+          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
+          loading="lazy"
+          onError={(e) => {
+            e.currentTarget.src = getCuratedFallbackPhoto("hotel", hotel.name);
+          }}
+        />
+        <div className="absolute inset-0 bg-gradient-to-t from-foreground/60 to-transparent" />
+
+        {/* Hotel Badge */}
+        <Badge
+          variant="outline"
+          className="absolute top-2.5 left-2.5 text-[10px] backdrop-blur-sm bg-indigo-100 text-indigo-700 border-indigo-300 font-semibold"
+        >
+          🏨 {language === "th" ? "ที่พัก" : "Accommodation"}
+        </Badge>
+
+        {/* Price Badge */}
+        {priceLabel && (
+          <span className="absolute top-2.5 right-2.5 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-300 backdrop-blur-sm">
+            {priceLabel}
+          </span>
+        )}
+
+        {/* Rating on image overlay */}
+        {hotel.rating != null && hotel.rating > 0 && (
+          <div className="absolute bottom-2 left-2.5 flex items-center gap-1 bg-card/90 backdrop-blur-sm rounded-full px-2 py-0.5">
+            <Star className="w-3 h-3 text-amber-500 fill-amber-500" />
+            <span className="text-[11px] font-semibold text-foreground">{hotel.rating.toFixed(1)}</span>
+          </div>
+        )}
+
+        {/* Google Maps Link */}
+        <a
+          href={
+            hotel.lat && hotel.lng
+              ? `https://www.google.com/maps/search/?api=1&query=${hotel.lat},${hotel.lng}`
+              : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hotel.name)}`
+          }
+          target="_blank"
+          rel="noopener noreferrer"
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute bottom-2 right-2.5 p-1.5 rounded-full bg-white/90 text-indigo-600 hover:bg-white hover:text-indigo-800 transition-colors z-20 shadow-sm flex items-center justify-center group/map"
+          title="View on Google Maps"
+        >
+          <MapPin className="w-3.5 h-3.5 transition-transform group-hover/map:scale-110" />
+        </a>
+      </div>
+
+      {/* Content */}
+      <div className="p-3.5">
+        <h4 className="font-semibold text-foreground text-sm leading-tight mb-1 line-clamp-2">{locPlace(hotel)}</h4>
+        <p className="text-xs text-muted-foreground line-clamp-3 leading-relaxed">{locDesc(hotel)}</p>
+
+        {/* Booking & Info Links */}
+        <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+          <a
+            href={buildBookingUrl(hotel.name, cityName, checkInDate, checkOutDate)}
+            target="_blank"
+            rel="noopener noreferrer"
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-500/20 transition-colors"
+            title="Book on Booking.com"
+          >
+            <span>Booking.com</span>
+            <ExternalLink className="w-2.5 h-2.5" />
+          </a>
+          <a
+            href={buildAgodaUrl(hotel.name, cityName, checkInDate, checkOutDate)}
+            target="_blank"
+            rel="noopener noreferrer"
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20 transition-colors"
+            title="Book on Agoda"
+          >
+            <span>Agoda</span>
+            <ExternalLink className="w-2.5 h-2.5" />
+          </a>
+          {hotel.website && (
+            <a
+              href={hotel.website}
+              target="_blank"
+              rel="noopener noreferrer"
+              onPointerDown={(e) => e.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+              onTouchStart={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors ml-auto"
+            >
+              <Globe className="w-3 h-3" />
+              <span>Web</span>
+            </a>
+          )}
+        </div>
+
+        {/* Add to itinerary button */}
+        <div
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
+        >
+          <Popover open={isPopoverOpen} onOpenChange={setIsPopoverOpen}>
+            <PopoverTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-2 w-full h-7 text-xs text-indigo-600 hover:bg-indigo-50 hover:text-indigo-700 relative z-10"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <Plus className="w-3 h-3 mr-1" />
+                {language === "th" ? "เพิ่มลงในแผนเดินทาง" : "Add to Itinerary"}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent
+              className="w-56 p-3 z-[100]"
+              onClick={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <div className="space-y-3">
+                <h4 className="font-semibold text-xs text-foreground pb-1 border-b">
+                  {language === "th" ? "เพิ่มที่พักลงแผนเดินทาง" : "Add Accommodation"}
+                </h4>
+                
+                {/* Check-in Group */}
+                <div className="space-y-1">
+                  <span className="text-[10px] font-semibold text-green-600 dark:text-green-400 block">
+                    {language === "th" ? "เช็คอิน" : "Check-in"}
+                  </span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-0.5">
+                      <Label className="text-[9px] text-muted-foreground">{language === "th" ? "วัน" : "Day"}</Label>
+                      <Select value={checkInDay} onValueChange={setCheckInDay}>
+                        <SelectTrigger className="h-7 text-xs px-2">
+                          <SelectValue placeholder={language === "th" ? "วัน" : "Day"} />
+                        </SelectTrigger>
+                        <SelectContent className="z-[110]">
+                          {Array.from({ length: daysCount }).map((_, i) => (
+                            <SelectItem key={i} value={i.toString()} className="text-xs">
+                              {language === "th" ? `วันที่ ${i + 1}` : `Day ${i + 1}`}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-0.5">
+                      <Label className="text-[9px] text-muted-foreground">{language === "th" ? "เวลา" : "Time"}</Label>
+                      <Select value={checkInTime} onValueChange={setCheckInTime}>
+                        <SelectTrigger className="h-7 text-xs px-2">
+                          <SelectValue placeholder={language === "th" ? "เวลา" : "Time"} />
+                        </SelectTrigger>
+                        <SelectContent className="z-[110] max-h-[160px]">
+                          {checkInTimes.map((t) => (
+                            <SelectItem key={t} value={t} className="text-xs">
+                              {t}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Check-out Group */}
+                <div className="space-y-1">
+                  <span className="text-[10px] font-semibold text-amber-600 dark:text-amber-400 block">
+                    {language === "th" ? "เช็คเอาท์" : "Check-out"}
+                  </span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-0.5">
+                      <Label className="text-[9px] text-muted-foreground">{language === "th" ? "วัน" : "Day"}</Label>
+                      <Select value={checkOutDay} onValueChange={setCheckOutDay}>
+                        <SelectTrigger className="h-7 text-xs px-2">
+                          <SelectValue placeholder={language === "th" ? "วัน" : "Day"} />
+                        </SelectTrigger>
+                        <SelectContent className="z-[110]">
+                          {Array.from({ length: daysCount }).map((_, i) => (
+                            <SelectItem key={i} value={i.toString()} className="text-xs">
+                              {language === "th" ? `วันที่ ${i + 1}` : `Day ${i + 1}`}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-0.5">
+                      <Label className="text-[9px] text-muted-foreground">{language === "th" ? "เวลา" : "Time"}</Label>
+                      <Select value={checkOutTime} onValueChange={setCheckOutTime}>
+                        <SelectTrigger className="h-7 text-xs px-2">
+                          <SelectValue placeholder={language === "th" ? "เวลา" : "Time"} />
+                        </SelectTrigger>
+                        <SelectContent className="z-[110] max-h-[160px]">
+                          {checkOutTimes.map((t) => (
+                            <SelectItem key={t} value={t} className="text-xs">
+                              {t}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </div>
+
+                <Button
+                  size="sm"
+                  className="w-full h-8 text-xs mt-2 bg-indigo-600 hover:bg-indigo-700"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAdd?.(
+                      hotel,
+                      parseInt(checkInDay, 10),
+                      checkInTime,
+                      parseInt(checkOutDay, 10),
+                      checkOutTime
+                    );
+                    setIsPopoverOpen(false);
+                  }}
+                >
+                  {language === "th" ? "ยืนยันเพิ่มที่พัก" : "Confirm Add"}
+                </Button>
+              </div>
+            </PopoverContent>
+          </Popover>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────
+// Drag Overlay Preview
+// ─────────────────────────────────────────
+export const HotelDragOverlay = ({ hotel }: { hotel: SuggestedPlace }) => {
+  const { language, locPlace } = useLanguage();
+  return (
+    <div className="w-64 rounded-2xl overflow-hidden bg-card border border-indigo-400 shadow-2xl scale-105 rotate-1">
+      <div className="relative h-36 overflow-hidden">
+        <img
+          src={hotel.image_url || getCuratedFallbackPhoto("hotel", hotel.name)}
+          alt={locPlace(hotel) || hotel.name}
+          className="w-full h-full object-cover"
+          onError={(e) => {
+            e.currentTarget.src = getCuratedFallbackPhoto("hotel", hotel.name);
+          }}
+        />
+        <div className="absolute inset-0 bg-gradient-to-t from-foreground/40 to-transparent" />
+      </div>
+      <div className="p-3.5">
+        <Badge variant="outline" className="text-[10px] mb-1.5 bg-indigo-100 text-indigo-700 border-indigo-300">
+          🏨 {language === "th" ? "ที่พัก" : "Accommodation"}
+        </Badge>
+        <h4 className="font-semibold text-foreground text-sm">{locPlace(hotel) || hotel.name}</h4>
+        <p className="text-xs text-muted-foreground mt-1">
+          {language === "th" ? "วางลงในวันที่ต้องการเพื่อเพิ่ม" : "Drop into a day to add"}
+        </p>
+      </div>
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────
+// Main Component
+// ─────────────────────────────────────────
+// Main Component
+// ─────────────────────────────────────────
+interface AIAccommodationsProps {
+  accommodations: SuggestedPlace[];
+  onAddToItinerary: (
+    hotel: SuggestedPlace,
+    checkInDay: number,
+    checkInTime: string,
+    checkOutDay: number,
+    checkOutTime: string
+  ) => void;
+  locationName: string;
+  daysCount: number;
+  onRefreshAccommodations?: () => Promise<void>;
+  isRefreshing?: boolean;
+  tripStartDate?: Date;
+  hasHotelFromPreferences?: boolean;
+  selectedHotelName?: string;
+  destinationCoords?: { lat: number; lng: number };
+}
+
+const AIAccommodations = ({
+  accommodations,
+  onAddToItinerary,
+  locationName,
+  daysCount,
+  onRefreshAccommodations,
+  isRefreshing,
+  tripStartDate,
+  hasHotelFromPreferences = false,
+  selectedHotelName,
+  destinationCoords,
+}: AIAccommodationsProps) => {
+  const { language, locPlace, locDesc } = useLanguage();
+  const [showSearch, setShowSearch] = useState(false);
+  const [showRecommendations, setShowRecommendations] = useState(false);
+  const [searchHotelName, setSearchHotelName] = useState("");
+  const [searchHotelLat, setSearchHotelLat] = useState<number | null>(null);
+  const [searchHotelLng, setSearchHotelLng] = useState<number | null>(null);
+  const [searchHotelPhotoUrl, setSearchHotelPhotoUrl] = useState<string | undefined>(undefined);
+  const [searchHotelPlaceId, setSearchHotelPlaceId] = useState<string | undefined>(undefined);
+  const [searchHotelRating, setSearchHotelRating] = useState<number | undefined>(undefined);
+  const [searchHotelRatingsTotal, setSearchHotelRatingsTotal] = useState<number | undefined>(undefined);
+  const [searchHotelAddress, setSearchHotelAddress] = useState<string | undefined>(undefined);
+  const [searchHotelWebsite, setSearchHotelWebsite] = useState<string | undefined>(undefined);
+  const [searchHotelPhone, setSearchHotelPhone] = useState<string | undefined>(undefined);
+
+  const [searchCheckInDay, setSearchCheckInDay] = useState<string>("0");
+  const [searchCheckInTime, setSearchCheckInTime] = useState<string>("15:00");
+  const [searchCheckOutDay, setSearchCheckOutDay] = useState<string>((daysCount > 0 ? daysCount - 1 : 0).toString());
+  const [searchCheckOutTime, setSearchCheckOutTime] = useState<string>("11:00");
+
+  const handleAdd = useCallback(
+    (
+      hotel: SuggestedPlace,
+      checkInDay: number,
+      checkInTime: string,
+      checkOutDay: number,
+      checkOutTime: string
+    ) => {
+      onAddToItinerary(hotel, checkInDay, checkInTime, checkOutDay, checkOutTime);
+      setShowSearch(false);
+      setShowRecommendations(false);
+      setSearchHotelName("");
+      setSearchHotelLat(null);
+      setSearchHotelLng(null);
+      setSearchHotelPhotoUrl(undefined);
+      setSearchHotelPlaceId(undefined);
+      setSearchHotelRating(undefined);
+      setSearchHotelRatingsTotal(undefined);
+      setSearchHotelAddress(undefined);
+      setSearchHotelWebsite(undefined);
+      setSearchHotelPhone(undefined);
+    },
+    [onAddToItinerary],
+  );
+
+  // Compute YYYY-MM-DD string for check-in and check-out
+  let checkInStr: string | undefined;
+  let checkOutStr: string | undefined;
+  if (tripStartDate) {
+    const inDate = new Date(tripStartDate);
+    const outDate = new Date(tripStartDate);
+    outDate.setDate(outDate.getDate() + (daysCount > 0 ? daysCount : 1));
+    checkInStr = inDate.toISOString().slice(0, 10);
+    checkOutStr = outDate.toISOString().slice(0, 10);
+  }
+
+  // custom selected hotel object
+  const customHotel: SuggestedPlace | null = searchHotelName ? {
+    id: `custom-hotel-${searchHotelPlaceId || "manual"}`,
+    name: searchHotelName,
+    category: "hotel",
+    description: searchHotelAddress ? `ที่พัก: ${searchHotelAddress}` : "Your custom selected accommodation",
+    lat: searchHotelLat ?? 0,
+    lng: searchHotelLng ?? 0,
+    photo_url: searchHotelPhotoUrl,
+    image_url: searchHotelPhotoUrl,
+    image: searchHotelPhotoUrl || "",
+    rating: searchHotelRating ?? null,
+    userRatingsTotal: searchHotelRatingsTotal ?? null,
+    website: searchHotelWebsite ?? null,
+    phoneNumber: searchHotelPhone ?? null,
+  } : null;
+
+  const hasHotel = hasHotelFromPreferences || !!selectedHotelName;
+
+  // Search Panel JSX helper
+  const renderSearchPanel = () => (
+    <div className="mb-6 p-4 rounded-2xl bg-indigo-50/60 dark:bg-indigo-950/30 border border-indigo-200/80 dark:border-indigo-800/60 animate-slide-up space-y-4 shadow-sm">
+      <div className="space-y-1.5">
+        <Label htmlFor="custom-hotel-search" className="text-sm font-semibold flex items-center gap-1.5 text-foreground">
+          <BedDouble className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+          {language === "th" ? "ค้นหาที่พัก (จากชื่อโรงแรม หรือ ลิงก์ Google Maps)" : "Search accommodation (by name or Google Maps link)"}
+        </Label>
+        <HotelSelectCombobox
+          id="custom-hotel-search"
+          value={searchHotelName}
+          onChange={(name, lat, lng, details) => {
+            setSearchHotelName(name);
+            setSearchHotelLat(lat ?? null);
+            setSearchHotelLng(lng ?? null);
+            setSearchHotelPhotoUrl(details?.photoUrl || undefined);
+            setSearchHotelPlaceId(details?.placeId || undefined);
+            setSearchHotelRating(details?.rating);
+            setSearchHotelRatingsTotal(details?.userRatingsTotal);
+            setSearchHotelAddress(details?.address);
+            setSearchHotelWebsite(details?.website);
+            setSearchHotelPhone(details?.phone);
+          }}
+          destinationName={locationName}
+          destinationCoords={destinationCoords}
+          placeholder={language === "th" ? "พิมพ์ชื่อโรงแรม หรือสลับไปแท็บลิงก์ Google Maps..." : "Type hotel name or switch to Google Maps link..."}
+        />
+      </div>
+
+      {customHotel && (
+        <div className="space-y-4 pt-3 border-t border-indigo-200/50 dark:border-indigo-800/50 animate-slide-up">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="search-checkin-day" className="text-xs font-medium flex items-center gap-1.5">
+                <Clock className="w-3.5 h-3.5 text-emerald-500" />
+                {language === "th" ? "วันและเวลา Check-in" : "Check-in Day & Time"}
+              </Label>
+              <div className="grid grid-cols-2 gap-1.5">
+                <select
+                  id="search-checkin-day"
+                  value={searchCheckInDay}
+                  onChange={(e) => setSearchCheckInDay(e.target.value)}
+                  className="w-full h-9 px-2 rounded-lg border border-border bg-background text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+                >
+                  {Array.from({ length: Math.max(1, daysCount) }, (_, i) => (
+                    <option key={i} value={i}>{language === "th" ? `วันที่ ${i + 1}` : `Day ${i + 1}`}</option>
+                  ))}
+                </select>
+                <select
+                  value={searchCheckInTime}
+                  onChange={(e) => setSearchCheckInTime(e.target.value)}
+                  className="w-full h-9 px-2 rounded-lg border border-border bg-background text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+                >
+                  {TIME_OPTIONS_24H.map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="search-checkout-day" className="text-xs font-medium flex items-center gap-1.5">
+                <Clock className="w-3.5 h-3.5 text-amber-500" />
+                {language === "th" ? "วันและเวลา Check-out" : "Check-out Day & Time"}
+              </Label>
+              <div className="grid grid-cols-2 gap-1.5">
+                <select
+                  id="search-checkout-day"
+                  value={searchCheckOutDay}
+                  onChange={(e) => setSearchCheckOutDay(e.target.value)}
+                  className="w-full h-9 px-2 rounded-lg border border-border bg-background text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+                >
+                  {Array.from({ length: Math.max(1, daysCount) }, (_, i) => (
+                    <option key={i} value={i}>{language === "th" ? `วันที่ ${i + 1}` : `Day ${i + 1}`}</option>
+                  ))}
+                </select>
+                <select
+                  value={searchCheckOutTime}
+                  onChange={(e) => setSearchCheckOutTime(e.target.value)}
+                  className="w-full h-9 px-2 rounded-lg border border-border bg-background text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+                >
+                  {TIME_OPTIONS_24H.map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setSearchHotelName("");
+                setSearchHotelLat(null);
+                setSearchHotelLng(null);
+                setSearchHotelPhotoUrl(undefined);
+                setSearchHotelPlaceId(undefined);
+                setSearchHotelRating(undefined);
+                setSearchHotelRatingsTotal(undefined);
+                setSearchHotelAddress(undefined);
+                setSearchHotelWebsite(undefined);
+                setSearchHotelPhone(undefined);
+              }}
+              className="text-muted-foreground hover:text-foreground text-xs px-3 h-8"
+            >
+              {language === "th" ? "ล้างข้อมูล" : "Clear"}
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                handleAdd(
+                  customHotel,
+                  parseInt(searchCheckInDay, 10),
+                  searchCheckInTime,
+                  parseInt(searchCheckOutDay, 10),
+                  searchCheckOutTime
+                );
+              }}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold px-4 h-8 gap-1.5 rounded-lg shadow-sm"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              {language === "th" ? "เพิ่มที่พักลงตารางเดินทาง" : "Add Hotel to Itinerary"}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  // Recommendations Carousel list JSX helper
+  const renderRecommendationsList = () => (
+    <div className="relative">
+      {accommodations && accommodations.length > 0 ? (
+        <div className="flex gap-4 overflow-x-auto pb-4 snap-x snap-mandatory scrollbar-thin">
+          {accommodations.map((hotel, idx) => (
+            <DraggableHotelCard
+              key={hotel?.id || `hotel-opt-${idx}`}
+              hotel={hotel as any}
+              onAdd={handleAdd}
+              daysCount={daysCount}
+              cityName={locationName}
+              checkInDate={checkInStr}
+              checkOutDate={checkOutStr}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="p-6 text-center text-xs text-muted-foreground bg-muted/20 rounded-2xl border border-dashed border-border/60 flex flex-col items-center gap-2">
+          <BedDouble className="w-8 h-8 text-muted-foreground/40" />
+          <p className="font-medium text-foreground">
+            {language === "th" ? `ยังไม่มีรายการแนะนำที่พักรอบ ${locationName}` : `No accommodation recommendations near ${locationName} yet`}
+          </p>
+          {onRefreshAccommodations && (
+            <Button
+              size="sm"
+              onClick={onRefreshAccommodations}
+              disabled={isRefreshing}
+              className="mt-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs gap-1.5 rounded-xl shadow-xs"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              {isRefreshing
+                ? (language === "th" ? "กำลังค้นหาที่พัก..." : "Finding accommodations...")
+                : (language === "th" ? "ค้นหาที่พักรอบเมืองปลายทาง" : "Find accommodations")}
+            </Button>
+          )}
+        </div>
+      )}
+      <p className="text-xs text-muted-foreground mt-2">
+        {language === "th"
+          ? "ลากการ์ดที่พักลงในวันของตารางเดินทาง หรือกด \"เพิ่มลงในแผนเดินทาง\" เพื่อเลือกวันและเวลา Check-in/out ที่ต้องการ"
+          : "Drag hotel card to a day in the itinerary or click \"Add to Itinerary\" to set check-in/out time"}
+      </p>
+    </div>
+  );
+
+  return (
+    <div className="animate-slide-up w-full">
+      {hasHotel ? (
+        /* Case 1: Has hotel from Preferences — Warm banner with search button */
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-indigo-200/80 bg-gradient-to-r from-indigo-50/90 via-sky-50/50 to-purple-50/40 dark:from-indigo-950/40 dark:via-sky-950/20 dark:to-purple-950/20 p-5 shadow-sm">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3.5 min-w-0">
+                <div className="w-12 h-12 rounded-2xl bg-indigo-100 dark:bg-indigo-900/60 border border-indigo-200 dark:border-indigo-800 flex items-center justify-center text-2xl shrink-0 shadow-inner">
+                  🏨
+                </div>
+                <div className="min-w-0">
+                  <h3 className="font-bold text-foreground text-base sm:text-lg flex items-center gap-2 flex-wrap">
+                    <span>
+                      {language === "th" ? "พักผ่อนที่ " : "Enjoy your stay at "}
+                      <span className="text-indigo-600 dark:text-indigo-400 font-extrabold underline decoration-indigo-300 underline-offset-4">
+                        {locPlace({ name: selectedHotelName }) || selectedHotelName || (language === "th" ? "โรงแรมที่คุณเลือก" : "your selected hotel")}
+                      </span>{" "}
+                      {language === "th" ? "ให้สบายนะครับ 😊🛌" : "😊🛌"}
+                    </span>
+                  </h3>
+                  <p className="text-xs sm:text-sm text-muted-foreground mt-0.5 font-medium">
+                    {language === "th" ? "หากต้องการเปลี่ยนหรือค้นหาที่พักอื่นทำได้ที่นี่" : "You can change or discover more accommodations here"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto justify-end flex-wrap">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowSearch(!showSearch)}
+                  className="text-xs rounded-xl border-indigo-300 dark:border-indigo-700 bg-white/90 dark:bg-slate-900/90 hover:bg-indigo-50 dark:hover:bg-indigo-950 text-indigo-700 dark:text-indigo-300 font-semibold gap-1.5 shadow-2xs h-8 px-3.5"
+                >
+                  <Search className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
+                  {showSearch
+                    ? (language === "th" ? "ซ่อนค้นหา" : "Hide Search")
+                    : (language === "th" ? "ค้นหา / เปลี่ยนที่พัก" : "Search / Change Hotel")}
+                </Button>
+                {accommodations.length > 0 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setShowRecommendations(!showRecommendations)}
+                    className="text-xs text-muted-foreground hover:text-foreground font-medium h-8"
+                  >
+                    {showRecommendations
+                      ? (language === "th" ? "ซ่อนคำแนะนำ" : "Hide Recommendations")
+                      : (language === "th" ? `ดูคำแนะนำที่พักอื่น (${accommodations.length})` : `More recommendations (${accommodations.length})`)}
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Manual Search Collapsible Panel */}
+          {showSearch && renderSearchPanel()}
+
+          {/* Optional Expanded Recommendations */}
+          {showRecommendations && (
+            <div className="animate-slide-up space-y-2 pt-2">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
+                  <Sparkles className="w-4 h-4 text-primary" />
+                  {language === "th" ? `ตัวเลือกที่พักแนะนำเพิ่มเติมใกล้ ${locPlace({ name: locationName }) || locationName}` : `More accommodation recommendations near ${locPlace({ name: locationName }) || locationName}`}
+                </h4>
+              </div>
+              {renderRecommendationsList()}
+            </div>
+          )}
+        </div>
+      ) : (
+        /* Case 2: No hotel selected yet — Show full recommendations list + search bar */
+        <div className="space-y-4">
+          <div className="flex items-center justify-between mb-2 flex-wrap gap-3">
+            <h2 className="text-2xl font-bold text-foreground flex items-center gap-2">
+              <BedDouble className="w-6 h-6 text-primary" />
+              {language === "th" ? `คำแนะนำที่พักใกล้ ${locPlace({ name: locationName }) || locationName}` : `Accommodation Recommendations near ${locPlace({ name: locationName }) || locationName}`}
+            </h2>
+            {onRefreshAccommodations && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onRefreshAccommodations}
+                disabled={isRefreshing}
+                className="gap-1.5 rounded-xl text-xs font-semibold"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? "animate-spin" : ""}`} />
+                {isRefreshing
+                  ? (language === "th" ? "กำลังค้นหา..." : "Finding…")
+                  : (language === "th" ? "ตัวเลือกเพิ่มเติม" : "More Options")}
+              </Button>
+            )}
+          </div>
+
+          <p className="text-sm text-muted-foreground">
+            {language === "th"
+              ? "ที่พักยังไม่ได้ถูกรวมในตารางเดินทางโดยอัตโนมัติ — คุณสามารถเลือกที่พักเพื่อดูรายละเอียด จอง หรือเพิ่มลงในวันที่ต้องการได้เลยครับ"
+              : "Accommodations are not automatically added — you can browse details, book, or add to any day in your itinerary."}
+          </p>
+
+          {/* Fake Search Bar Trigger */}
+          {!showSearch ? (
+            <button
+              onClick={() => setShowSearch(true)}
+              className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl border border-border bg-card hover:border-primary/50 hover:shadow-md transition-all duration-200 group text-left"
+            >
+              <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-primary/10 group-hover:bg-primary/20 transition-colors shrink-0">
+                <Search className="w-4 h-4 text-primary" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-foreground leading-none mb-0.5">
+                  {language === "th" ? "ค้นหาที่พักเอง (พิมพ์ชื่อ หรือ วางลิงก์ Google Maps)" : "Search hotel manually (by Name or Google Maps link)"}
+                </p>
+                <p className="text-xs text-muted-foreground truncate">
+                  {language === "th" ? "ค้นหาชื่อโรงแรม หรือวางลิงก์ Google Maps เพื่อระบุที่พักและนำทางอัตโนมัติ..." : "Search hotel name or paste Google Maps link to schedule..."}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {accommodations.length > 0 && (
+                  <span className="text-xs bg-primary/5 border border-primary/20 text-primary px-2.5 py-1 rounded-full font-medium hidden sm:inline-flex">
+                    {accommodations.length} available
+                  </span>
+                )}
+                <div className="w-7 h-7 rounded-full bg-primary flex items-center justify-center shadow-sm group-hover:scale-110 transition-transform">
+                  <Plus className="w-3.5 h-3.5 text-primary-foreground" />
+                </div>
+              </div>
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={() => setShowSearch(false)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-primary/40 bg-primary/10 text-primary text-xs font-medium hover:bg-primary/20 transition-colors"
+              >
+                <ChevronUp className="w-3.5 h-3.5" />
+                {language === "th" ? "ซ่อนกล่องค้นหา" : "Hide Search Panel"}
+              </button>
+              {accommodations.length > 0 && (
+                <span className="text-xs bg-primary/5 border border-primary/20 text-primary px-3 py-1 rounded-full font-medium">
+                  {accommodations.length} options available
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Manual Search Collapsible Panel */}
+          {showSearch && renderSearchPanel()}
+
+          {/* Hotel Cards — horizontal scroll */}
+          {renderRecommendationsList()}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default AIAccommodations;
+

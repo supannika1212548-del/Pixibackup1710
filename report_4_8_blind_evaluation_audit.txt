@@ -1,0 +1,53 @@
+================================================================================
+PIXINERARY THESIS: SECTION 4.8 BLIND EVALUATION DATA INTEGRITY REPORT
+================================================================================
+Generated Date: 2026-10-17
+Primary File Audited: D:\1210backup\backend\experiment\blind_evaluations.json
+Total Records Available: 2
+
+1. DATA INVENTORY & VERIFICATION
+--------------------------------------------------------------------------------
+- Test Scenarios Evaluated: SC-01
+- Evaluators Recorded: Expert 1, Expert 2 (Count = 2)
+- Plan Labels Recorded: แผน A
+- Paired Plan B Records: MISSING (0 records for Plan B)
+
+2. RECORD DETAILS
+--------------------------------------------------------------------------------
+Record eval_a17a6fbe: Scenario=SC-01 | Blind Label=แผน A | Actual Model=openai-gpt-54 | Evaluator=Expert 1 | Pick=True | Mean Score=4.60
+Record eval_a4cc964a: Scenario=SC-01 | Blind Label=แผน A | Actual Model=google-gemini-38-flash | Evaluator=Expert 2 | Pick=False | Mean Score=4.00
+
+3. METHODOLOGICAL CONSTRAINTS & LIMITATIONS
+--------------------------------------------------------------------------------
+[CRITICAL FINDING 1: Absence of Paired Plan B Evaluation]
+The current repository contains only 2 evaluation records, both assigned to 'แผน A' 
+(Plan A) under Scenario ['SC-01']. No corresponding Plan B evaluations exist in the local 
+dataset. Consequently, a head-to-head A/B comparison or relative win-rate calculation cannot be 
+performed without fabricating unobserved data.
+
+[CRITICAL FINDING 2: Inapplicability of Inter-Rater Agreement & Preference Distribution]
+Because both records evaluate the same scenario from distinct actual models without a mutual 
+paired choice between Plan A and Plan B, statistical metrics such as Cohen's Kappa, Fleiss' Kappa, 
+or Win/Loss/Tie percentage distributions are mathematically and methodologically invalid.
+
+[DECISION ON GRAPH CREATION]:
+1. Graph 1 (fig_4_8_1_blind_evaluation_scores.png): CREATED
+   - Renders ONLY the observed Likert scores across the 5 evaluation criteria for the 2 pilot evaluators.
+   - Distinctly annotates that both records represent Plan A in a pilot evaluation (N = 2).
+   - Explicitly does NOT display fictitious Plan B scores.
+
+2. Graph 2 (fig_4_8_2_plan_preference.png): INTENTIONALLY SKIPPED
+   - Rationale: A preference distribution requires paired pairwise choices (A vs B or Win/Loss/Tie).
+   - Creating this chart with unpaired single-sided data would constitute research malpractice.
+
+4. REQUIRED DATA COLLECTION PROTOCOL TO COMPLETE SECTION 4.8
+--------------------------------------------------------------------------------
+To achieve rigorous publication standards for Section 4.8 in the final thesis, the following 
+empirical protocol must be completed:
+  1. Multi-Scenario Coverage: Deploy at least 5–10 representative travel scenarios (e.g., SC-01 to SC-10).
+  2. Balanced A/B Pairings: For each scenario, generate paired plans from competing LLM architectures 
+     (e.g., Claude Sonnet 5 vs GPT-5.4 vs Gemini 3.8 Flash) with randomized, double-blind assignments.
+  3. Multi-Expert Panel: Recruit at least 3–5 independent certified tourism domain experts.
+  4. Decision Capture: Record both Likert dimensional ratings and explicit pairwise forced-choice 
+     preferences (Plan A wins, Plan B wins, or Tie) to enable Fleiss' Kappa inter-rater reliability.
+================================================================================

@@ -1,0 +1,6 @@
+﻿Dimension_Code,Dimension_Name,Thai_Name,Item_Count,Total_Responses,Mean_Score,SD
+DKA,Accuracy of Tourism Content,ความถูกต้องของเนื้อหาการท่องเที่ยว,5,10,4.2,0.632
+PFC,Practical Feasibility,ความเป็นไปได้ในทางปฏิบัติ,6,12,4.167,0.577
+DVC,Diversity & Coverage,ความหลากหลายและความครอบคลุม,5,10,3.9,0.738
+INV,Innovation & Tourism Utility,นวัตกรรมและประโยชน์ต่อวงการ,5,10,4.4,0.516
+CMP,Comparison with Existing Tools,การเปรียบเทียบกับเครื่องมือเดิม,4,8,4.125,0.641

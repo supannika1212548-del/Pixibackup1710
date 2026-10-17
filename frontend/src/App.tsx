@@ -1,0 +1,69 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { Toaster as Sonner } from "@/components/ui/sonner";
+import { Toaster } from "@/components/ui/toaster";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { AIProvider } from "@/context/AIProviderContext";
+import { AuthProvider } from "@/context/AuthContext";
+import { LanguageProvider } from "@/context/LanguageContext";
+import { ProtectedRoute } from "@/components/ProtectedRoute";
+import Index from "./pages/Index.tsx";
+import Login from "./pages/Login.tsx";
+import BlindEvaluation from "./pages/BlindEvaluation.tsx";
+import ExperimentConsole from "./pages/ExperimentConsole.tsx";
+import Exp2PipelineComparison from "./pages/Exp2PipelineComparison.tsx";
+import Exp3RobustnessTest from "./pages/Exp3RobustnessTest.tsx";
+import Exp4PromptSensitivity from "./pages/Exp4PromptSensitivity.tsx";
+import Exp5ConsistencyTest from "./pages/Exp5ConsistencyTest.tsx";
+import Exp6PlanEvaluation from "./pages/Exp6PlanEvaluation.tsx";
+
+import NotFound from "./pages/NotFound.tsx";
+import TripExportPage from "./pages/TripExportPage.tsx";
+import Demo from "./pages/Demo.tsx";
+import { useEffect } from "react";
+import { testGeminiConnection, testOpenAIConnection } from "@/services/aiService";
+
+const queryClient = new QueryClient();
+
+const App = () => {
+  useEffect(() => {
+    testGeminiConnection();
+    testOpenAIConnection();
+  }, []);
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AuthProvider>
+        <AIProvider>
+          <LanguageProvider>
+            <TooltipProvider>
+              <Toaster />
+              <Sonner />
+              <BrowserRouter>
+                <Routes>
+                  <Route path="/login" element={<Login />} />
+                  <Route path="/" element={<ProtectedRoute><Index /></ProtectedRoute>} />
+                  <Route path="/blind-eval" element={<ProtectedRoute allowedRoles={["dev", "expert"]}><BlindEvaluation /></ProtectedRoute>} />
+                  <Route path="/experiment" element={<ProtectedRoute allowedRoles={["dev"]}><Exp4PromptSensitivity /></ProtectedRoute>} />
+                  <Route path="/experiment/exp1" element={<ProtectedRoute allowedRoles={["dev"]}><Exp4PromptSensitivity /></ProtectedRoute>} />
+                  <Route path="/experiment/exp2" element={<ProtectedRoute allowedRoles={["dev"]}><ExperimentConsole /></ProtectedRoute>} />
+                  <Route path="/experiment/exp3" element={<ProtectedRoute allowedRoles={["dev"]}><Exp2PipelineComparison /></ProtectedRoute>} />
+                  <Route path="/experiment/exp4" element={<ProtectedRoute allowedRoles={["dev"]}><Exp3RobustnessTest /></ProtectedRoute>} />
+                  <Route path="/experiment/exp5" element={<ProtectedRoute allowedRoles={["dev"]}><Exp5ConsistencyTest /></ProtectedRoute>} />
+                  <Route path="/experiment/exp6" element={<ProtectedRoute allowedRoles={["dev"]}><Exp6PlanEvaluation /></ProtectedRoute>} />
+
+                  <Route path="/export/trip" element={<TripExportPage />} />
+                  <Route path="/demo" element={<Demo />} />
+                  {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+                  <Route path="*" element={<NotFound />} />
+                </Routes>
+              </BrowserRouter>
+            </TooltipProvider>
+          </LanguageProvider>
+        </AIProvider>
+      </AuthProvider>
+    </QueryClientProvider>
+  );
+};
+
+export default App;

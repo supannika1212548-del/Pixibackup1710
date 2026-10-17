@@ -1,0 +1,1498 @@
+import React, { useState, useEffect, useCallback, useMemo } from "react";
+import { ExperimentLayout } from "./ExperimentLayout";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { toast } from "sonner";
+import { AI_MODEL_OPTIONS, AIModelType, MODEL_ID_MAP } from "@/context/AIProviderContext";
+import { safeFetch, fileToBase64Optimized } from "@/utils/apiUtils";
+import { safeParseJson } from "@/utils/jsonRepair";
+import {
+  evaluatePredictionWithAliases,
+  classifyErrorCategory,
+  FailureMode,
+  FAILURE_MODE_CONFIGS,
+} from "@/utils/evaluationMetrics";
+import { HumanDoubleCheckButton } from "@/components/experiment/HumanDoubleCheckButton";
+import { KeyTakeawaysCard } from "@/components/experiment/KeyTakeawaysCard";
+import {
+  VPRTier,
+  TIER_CONFIGS,
+  TIER_OPTIONS,
+  TIER_ORDER,
+  detectTierFromFilename,
+  normalizeTier,
+} from "@/types/experimentTiers";
+import {
+  Upload,
+  Sliders,
+  Save,
+  Eye,
+  Trophy,
+  BarChart3,
+  XCircle,
+  CheckCircle2,
+  FileCode2,
+  Check,
+  Play,
+  Sparkles,
+  MessageSquare,
+  BookOpen,
+  Copy,
+  Terminal,
+  ChevronDown,
+  ChevronUp,
+  Download,
+} from "lucide-react";
+import { downloadCsv } from "@/utils/csvExport";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip as RechartsTooltip,
+  Cell,
+  RadarChart,
+  PolarGrid,
+  PolarAngleAxis,
+  Radar,
+  ReferenceLine,
+  CartesianGrid,
+} from "recharts";
+
+interface PromptVariant {
+  id: string;
+  name: string;
+  tag: string;
+  description: string;
+  /** Academic citation for thesis documentation */
+  academicRef: string;
+  promptText: (gt: string) => string;
+}
+
+/**
+ * 5 Canonical Prompt Paradigms for VPR Evaluation
+ * ─────────────────────────────────────────────────
+ * Each paradigm tests a distinct, non-overlapping dimension of model capability:
+ *
+ * P1 — Zero-Shot Baseline       : Pure capability, no guidance (Brown et al., 2020)
+ * P2 — Persona / Role Prompting : Role-framing effect on VPR accuracy (Reynolds & McDonell, 2021)
+ * P3 — Chain-of-Thought (CoT)   : Intermediate reasoning chain benefit (Wei et al., 2022)
+ * P4 — Cross-Lingual (TH)       : Language-controlled: same structure as P1, Thai only (Shi et al., 2022)
+ * P5 — Few-Shot ICL             : In-context learning with exemplar demonstrations (Brown et al., 2020)
+ *
+ * Design principle: single-variable isolation — only ONE dimension changes between paradigms.
+ * P4 is an isomorphic Thai translation of P1 to isolate the language variable strictly.
+ */
+const PROMPT_VARIANTS: PromptVariant[] = [
+  {
+    id: "P1",
+    name: "P1: Zero-Shot Direct (EN)",
+    tag: "Zero-Shot",
+    academicRef: "Brown et al., 2020 (GPT-3 / NeurIPS)",
+    description: "Minimal direct query — measures pure model baseline capability with zero guidance.",
+    promptText: () =>
+      `What specific landmark, city, or place is shown in this image? Return strictly valid JSON: {"place": "Name", "country": "Country", "confidence": 0.95, "ai_reasoning": ["key visual feature"]}.`,
+  },
+  {
+    id: "P2",
+    name: "P2: Expert Persona (Role)",
+    tag: "Persona Prompting",
+    academicRef: "Reynolds & McDonell, 2021; White et al., 2023 (Prompt Patterns Catalog)",
+    description: "Assigns an expert geographer role to the model — tests whether role-framing improves VPR accuracy.",
+    promptText: () =>
+      `You are an expert geographer and visual landmark recognition specialist with encyclopedic knowledge of world landmarks, architecture, and travel destinations. Analyze this image and identify the specific landmark or place shown. Return strictly valid JSON: {"place": "Name", "country": "Country", "confidence": 0.95, "ai_reasoning": ["key visual feature"]}.`,
+  },
+  {
+    id: "P3",
+    name: "P3: Chain-of-Thought (CoT)",
+    tag: "Chain-of-Thought",
+    academicRef: "Wei et al., 2022 (Chain-of-Thought Prompting / NeurIPS)",
+    description: "Forces step-by-step visual feature decomposition before final answer — tests reasoning chain benefit.",
+    promptText: () =>
+      `Analyze this image step-by-step:\n1. Identify the dominant architectural style, landscape type, or visible signage.\n2. List distinctive visual features (materials, shape, color, scale).\n3. Compare with known world landmarks matching those features.\n4. Conclude with the most likely specific place.\nReturn strictly valid JSON: {"place": "Name", "country": "Country", "confidence": 0.95, "ai_reasoning": ["step 1 observation", "step 2 distinctive feature", "step 3 comparison", "step 4 conclusion"]}.`,
+  },
+  {
+    id: "P4",
+    name: "P4: Cross-Lingual Thai (TH)",
+    tag: "Cross-Lingual",
+    academicRef: "Shi et al., 2022 (Language Models are Multilingual CoT Reasoners / ICLR 2023)",
+    description: "Isomorphic Thai translation of P1 — structure is identical, only language changes. Isolates language variable strictly.",
+    promptText: () =>
+      `สถานที่ท่องเที่ยว เมือง หรือแลนด์มาร์กใดปรากฏในภาพนี้? คืนค่าเป็น JSON ที่ถูกต้องเท่านั้น: {"place": "ชื่อสถานที่", "country": "ประเทศ", "confidence": 0.95, "ai_reasoning": ["ลักษณะภาพที่สำคัญ"]}.`,
+  },
+  {
+    id: "P5",
+    name: "P5: Few-Shot In-Context (ICL)",
+    tag: "Few-Shot ICL",
+    academicRef: "Brown et al., 2020 (GPT-3); Min et al., 2022 (Rethinking ICL / EMNLP)",
+    description: "2-shot exemplar demonstrations before the target image — tests in-context learning from landmark examples.",
+    promptText: () =>
+      `Here are two landmark identification examples:\nExample 1 — Input: [Image of an iron lattice tower with Paris cityscape behind it] → Output: {"place": "Eiffel Tower", "country": "France", "confidence": 0.98, "ai_reasoning": ["iron lattice structure", "Seine river visible", "Paris cityscape background"]}\nExample 2 — Input: [Image of a white marble mausoleum with reflecting pool, Agra India] → Output: {"place": "Taj Mahal", "country": "India", "confidence": 0.99, "ai_reasoning": ["white marble dome", "four minarets at corners", "ornate Mughal architecture"]}\n\nNow analyze the provided image using the same approach. Return strictly valid JSON: {"place": "Name", "country": "Country", "confidence": 0.95, "ai_reasoning": ["reason 1", "reason 2"]}.`,
+  },
+];
+
+const VARIANT_COLORS: Record<string, string> = {
+  P1: "#6366f1",
+  P2: "#3b82f6",
+  P3: "#8b5cf6",
+  P4: "#f59e0b",
+  P5: "#10b981",
+};
+
+interface Exp4Result {
+  variant_id: string;
+  variant_name: string;
+  model: AIModelType;
+  modelLabel: string;
+  predicted: string;
+  confidence: number;
+  time_ms: number;
+  is_correct: boolean;
+  recall_rank?: number;
+  match_score?: number;
+  user_verified?: boolean;
+  reasoning: string;
+  tier?: VPRTier;
+  matched_alias?: string | null;
+  failure_mode?: FailureMode;
+  temperature?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cost_usd?: number;
+  tokens_per_sec?: number;
+  openrouter_id?: string;
+  generation_time_ms?: number;
+  pure_tokens_per_sec?: number;
+  provider_name?: string;
+}
+
+interface Exp4History {
+  timestamp: string;
+  image_name: string;
+  ground_truth: string;
+  tier: VPRTier;
+  model: string;
+  variant_id: string;
+  variant_name: string;
+  predicted: string;
+  confidence: number | string;
+  time_ms: number | string;
+  is_correct: string | boolean;
+  recall_rank?: number;
+  matched_alias?: string | null;
+  reasoning: string;
+  failure_mode?: FailureMode;
+  temperature?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cost_usd?: number;
+  tokens_per_sec?: number;
+  openrouter_id?: string;
+  generation_time_ms?: number;
+  pure_tokens_per_sec?: number;
+  provider_name?: string;
+}
+
+function isTruthy(v: string | boolean | undefined): boolean {
+  return v === true || v === "true" || v === "True" || v === "1";
+}
+
+export default function Exp4PromptSensitivity() {
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [groundTruth, setGroundTruth] = useState<string>("");
+  const [singleTier, setSingleTier] = useState<VPRTier>("tier1_iconic");
+  const [selectedModels, setSelectedModels] = useState<AIModelType[]>([
+    "google-gemini-38-flash",
+  ]);
+  const [selectedVariants, setSelectedVariants] = useState<string[]>(["P1", "P2", "P3", "P4", "P5"]);
+
+  const [isRunning, setIsRunning] = useState(false);
+  const [progressLabel, setProgressLabel] = useState("");
+  const [currentResults, setCurrentResults] = useState<Exp4Result[]>([]);
+  const [dbLogs, setDbLogs] = useState<Exp4History[]>([]);
+  const [activeReasoning, setActiveReasoning] = useState<{ name: string; text: string } | null>(null);
+  const [copiedLatex, setCopiedLatex] = useState(false);
+  const [promptView, setPromptView] = useState<"bar" | "matrix">("bar");
+  const [copiedVariantId, setCopiedVariantId] = useState<string | null>(null);
+  const [expandedPrompts, setExpandedPrompts] = useState<Record<string, boolean>>({
+    P1: true,
+    P2: true,
+    P3: true,
+    P4: true,
+    P5: true,
+  });
+
+  const handleCopyPrompt = (e: React.MouseEvent, id: string, text: string) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(text);
+    setCopiedVariantId(id);
+    toast.success(`Copied ${id} prompt template to clipboard!`);
+    setTimeout(() => setCopiedVariantId(null), 2000);
+  };
+
+  const fetchHistory = useCallback(async () => {
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8080"}/experiment/results_exp1`);
+      if (res.ok) {
+        const data = await res.json();
+        const mapped = (data.results || []).map((row: any) => ({
+          timestamp: row["Timestamp"] || row.timestamp || "",
+          image_name: row["Image Name"] || row.image_name || "",
+          ground_truth: row["Ground Truth"] || row.ground_truth || "",
+          tier: normalizeTier(row["Tier"] || row.tier || "tier1_iconic"),
+          model: row["Model"] || row.model || "",
+          variant_id: row["Prompt Variant ID"] || row.variant_id || "",
+          variant_name: row["Prompt Variant Name"] || row.variant_name || "",
+          predicted: row["Predicted Place"] || row.predicted || "",
+          confidence: row["Confidence"] !== undefined ? row["Confidence"] : row.confidence,
+          time_ms: row["Time MS"] !== undefined ? row["Time MS"] : row.time_ms,
+          is_correct: row["Is Correct"] !== undefined ? row["Is Correct"] : row.is_correct,
+          recall_rank: row["Recall Rank"] !== undefined ? Number(row["Recall Rank"]) : (isTruthy(row["Is Correct"] || row.is_correct) ? 1 : 0),
+          matched_alias: row["Matched Alias"] || row.matched_alias || null,
+          reasoning: row["AI Reasoning"] || row.reasoning || "",
+          failure_mode: (row["Failure Mode"] || row.failure_mode || "none") as FailureMode,
+          temperature: row["Temperature"] !== undefined ? Number(row["Temperature"]) : 0.0,
+          prompt_tokens: row["Prompt Tokens"] !== undefined ? Number(row["Prompt Tokens"]) : row.prompt_tokens,
+          completion_tokens: row["Completion Tokens"] !== undefined ? Number(row["Completion Tokens"]) : row.completion_tokens,
+          total_tokens: row["Total Tokens"] !== undefined ? Number(row["Total Tokens"]) : row.total_tokens,
+          cost_usd: row["Cost USD"] !== undefined ? Number(row["Cost USD"]) : row.cost_usd,
+          tokens_per_sec: row["Tokens Per Sec"] !== undefined ? Number(row["Tokens Per Sec"]) : row.tokens_per_sec,
+          openrouter_id: row["OpenRouter ID"] || row.openrouter_id || "",
+          generation_time_ms: row["Generation Time MS"] ? Number(row["Generation Time MS"]) : undefined,
+          pure_tokens_per_sec: row["Pure Tokens Per Sec"] ? Number(row["Pure Tokens Per Sec"]) : undefined,
+          provider_name: row["Provider Name"] || row.provider_name || "",
+        }));
+        setDbLogs(mapped);
+      }
+    } catch (e) {
+      console.error("Failed to load Exp4 history:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setImageFile(file);
+      setImagePreview(URL.createObjectURL(file));
+      const guessed = file.name.substring(0, file.name.lastIndexOf(".")).replace(/[-_]/g, " ");
+      setGroundTruth(guessed);
+      setSingleTier(detectTierFromFilename(file.name));
+      setCurrentResults([]);
+    }
+  };
+
+  const runPromptSensitivityTest = async () => {
+    if (!imageFile || !groundTruth.trim()) {
+      toast.error("Please upload an image and specify Ground Truth.");
+      return;
+    }
+    if (selectedVariants.length === 0) {
+      toast.error("Select at least one Prompt Variant.");
+      return;
+    }
+
+    setIsRunning(true);
+    setCurrentResults([]);
+    const temp: Exp4Result[] = [];
+
+    const base64Image = await fileToBase64Optimized(imageFile);
+
+    for (const mVal of selectedModels) {
+      const modelId = MODEL_ID_MAP[mVal];
+      const modelOpt = AI_MODEL_OPTIONS.find((m) => m.value === mVal);
+      const modelLabel = modelOpt ? modelOpt.label : mVal;
+
+      for (const vId of selectedVariants) {
+        const vObj = PROMPT_VARIANTS.find((v) => v.id === vId)!;
+        setProgressLabel(`Testing [${modelLabel}] with [${vObj.name}]...`);
+
+        const promptText = vObj.promptText(groundTruth);
+        const start = performance.now();
+
+      let pred = "Unknown";
+      let reasoningText = "";
+      let callMetrics: any = null;
+      let parsedConfidence = 0.85;
+
+      try {
+        const data = await safeFetch<any>(`${import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8080"}/ai`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: modelId,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: promptText },
+                  { type: "image_url", image_url: { url: base64Image } },
+                ],
+              },
+            ],
+            expect_json: true,
+            allow_fallback: false,
+            temperature: 0.1,
+            max_tokens: 1024,
+          }),
+        });
+        callMetrics = data?.metrics;
+
+        const raw = data.text?.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim() || "";
+        let parsed: any = {};
+        try {
+          parsed = safeParseJson<any>(raw);
+        } catch {
+          const placeRegexMatch = raw.match(/"place"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i);
+          parsed = { place: placeRegexMatch ? placeRegexMatch[1].replace(/\\(.)/g, "$1").trim() : raw };
+        }
+
+        // All 5 paradigms now return {"place": ...} — no special-case needed
+        if (parsed.place) {
+          pred = String(parsed.place);
+        }
+
+        if (parsed.ai_reasoning) {
+          reasoningText = Array.isArray(parsed.ai_reasoning) ? parsed.ai_reasoning.join("; ") : String(parsed.ai_reasoning);
+        } else {
+          reasoningText = raw;
+        }
+        // Parse confidence score if returned by model, fallback to 0.85
+        if (typeof parsed.confidence === "number") {
+          parsedConfidence = Math.min(1.0, Math.max(0.0, parsed.confidence));
+        } else if (parsed.confidence) {
+          const num = parseFloat(String(parsed.confidence));
+          if (!isNaN(num)) {
+            parsedConfidence = Math.min(1.0, Math.max(0.0, num > 1.0 && num <= 100.0 ? num / 100.0 : num));
+          }
+        }
+      } catch (err: any) {
+        console.error(`Exp4 error for ${vObj.name}:`, err);
+        const errMsg = err?.message || String(err);
+        const isRateLimit = errMsg.includes("429") || errMsg.includes("rate-limit") || errMsg.includes("temporarily");
+        pred = isRateLimit ? "Upstream Rate-Limited (429)" : "API Error";
+        reasoningText = errMsg;
+        parsedConfidence = 0.0;
+        toast.warning(`[${modelLabel}] ${vObj.name}: ${isRateLimit ? "Rate-limited upstream (429)" : "Request error"}`);
+      }
+
+      const duration = Math.round(performance.now() - start);
+
+      // Automated Multi-alias evaluation
+      const match = evaluatePredictionWithAliases(pred, groundTruth, [], 0.70);
+
+      // Failure Mode Taxonomy (3 Symptoms)
+      const failureMode = classifyErrorCategory(pred, groundTruth, {
+        isCorrect: match.isCorrect,
+        confidence: parsedConfidence,
+        tier: singleTier,
+      });
+
+      temp.push({
+        variant_id: vObj.id,
+        variant_name: vObj.name,
+        tier: singleTier,
+        model: mVal,
+        modelLabel,
+        predicted: pred,
+        confidence: parsedConfidence,
+        time_ms: callMetrics?.latency_ms ? Math.round(callMetrics.latency_ms) : duration,
+        is_correct: match.isCorrect,
+        recall_rank: match.rank,
+        match_score: match.matchScore,
+        user_verified: false,
+        reasoning: reasoningText,
+        matched_alias: match.matchedAlias,
+        failure_mode: failureMode,
+        temperature: 0.1,
+        prompt_tokens: callMetrics?.prompt_tokens ?? 0,
+        completion_tokens: callMetrics?.completion_tokens ?? 0,
+        total_tokens: callMetrics?.total_tokens ?? 0,
+        cost_usd: callMetrics?.cost_usd ?? 0.0,
+        tokens_per_sec: callMetrics?.tokens_per_sec ?? 0.0,
+        openrouter_id: callMetrics?.openrouter_id || "",
+      });
+
+      setCurrentResults([...temp]);
+    }
+  }
+
+  setIsRunning(false);
+  setProgressLabel("");
+  toast.success("Prompt Sensitivity Test Complete! Predictions graded with aliases.");
+  };
+
+  const updateCorrectness = (index: number, value: boolean) => {
+    setCurrentResults((prev) => {
+      const updated = [...prev];
+      const prevMode = updated[index].failure_mode;
+      updated[index] = {
+        ...updated[index],
+        is_correct: value,
+        user_verified: true,
+        failure_mode: value ? "none" : (prevMode && prevMode !== "none" ? prevMode : "visual_confusion"),
+      };
+      return updated;
+    });
+  };
+
+  const updateFailureMode = (index: number, mode: FailureMode) => {
+    setCurrentResults((prev) => {
+      const updated = [...prev];
+      updated[index] = {
+        ...updated[index],
+        failure_mode: mode,
+      };
+      return updated;
+    });
+  };
+
+  const commitResults = async () => {
+    if (currentResults.length === 0) return;
+
+    const payload = {
+      image_name: imageFile?.name || "image.jpg",
+      ground_truth: groundTruth,
+      tier: singleTier,
+      temperature: 0.1,
+      results: currentResults.map((r) => ({
+        variant_id: r.variant_id,
+        variant_name: r.variant_name,
+        tier: r.tier || singleTier,
+        model: r.model,
+        predicted: r.predicted,
+        confidence: r.confidence,
+        time_ms: r.time_ms,
+        is_correct: r.is_correct,
+        recall_rank: r.recall_rank,
+        matched_alias: r.matched_alias,
+        reasoning: r.reasoning,
+        temperature: 0.1,
+        failure_mode: r.failure_mode || "none",
+        prompt_tokens: r.prompt_tokens ?? 0,
+        completion_tokens: r.completion_tokens ?? 0,
+        total_tokens: r.total_tokens ?? 0,
+        cost_usd: r.cost_usd ?? 0.0,
+        tokens_per_sec: r.tokens_per_sec ?? 0.0,
+        openrouter_id: r.openrouter_id || "",
+      })),
+    };
+
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8080"}/experiment/save_exp1`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (res.ok) {
+        toast.success("Prompt sensitivity results committed!");
+        fetchHistory();
+        setCurrentResults([]);
+      }
+    } catch (e) {
+      toast.error("Failed to save Exp1 results.");
+    }
+  };
+
+  // Analytics Computation
+  const analytics = useMemo(() => {
+    if (dbLogs.length === 0) return null;
+
+    const variantStats: Record<string, { total: number; correct: number; times: number[] }> = {};
+    PROMPT_VARIANTS.forEach((v) => {
+      variantStats[v.id] = { total: 0, correct: 0, times: [] };
+    });
+
+    dbLogs.forEach((row) => {
+      const vId = row.variant_id || "P1";
+      if (!variantStats[vId]) variantStats[vId] = { total: 0, correct: 0, times: [] };
+      variantStats[vId].total += 1;
+      if (isTruthy(row.is_correct)) variantStats[vId].correct += 1;
+      if (row.time_ms) variantStats[vId].times.push(Number(row.time_ms));
+    });
+
+    const variantBreakdown = PROMPT_VARIANTS.map((v) => {
+      const d = variantStats[v.id] || { total: 0, correct: 0, times: [] };
+      const accuracy = d.total > 0 ? Math.round((d.correct / d.total) * 100) : 0;
+      const avgTime = d.times.length > 0 ? Math.round(d.times.reduce((a, b) => a + b, 0) / d.times.length) : 0;
+      return {
+        id: v.id,
+        name: v.name,
+        tag: v.tag,
+        accuracy,
+        avgTime,
+        total: d.total,
+        color: VARIANT_COLORS[v.id] || "#6366f1",
+      };
+    });
+
+    const bestVariant = [...variantBreakdown].sort((a, b) => b.accuracy - a.accuracy)[0];
+
+    // Model x Variant Heatmap Matrix
+    const modelList = Array.from(new Set(dbLogs.map((r) => r.model)));
+    const matrixRows = modelList.map((m) => {
+      const opt = AI_MODEL_OPTIONS.find((o) => o.value === m);
+      const row: Record<string, any> = {
+        model: m,
+        modelLabel: opt ? opt.label : m,
+      };
+      PROMPT_VARIANTS.forEach((v) => {
+        const subset = dbLogs.filter((r) => r.model === m && (r.variant_id || "P1") === v.id);
+        const correct = subset.filter((r) => isTruthy(r.is_correct)).length;
+        row[v.id] = subset.length > 0 ? Math.round((correct / subset.length) * 100) : null;
+        row[`${v.id}_count`] = subset.length;
+      });
+      return row;
+    });
+
+    return {
+      variantBreakdown,
+      bestVariant,
+      matrixRows,
+      total: dbLogs.length,
+    };
+  }, [dbLogs]);
+
+  const copyPromptLatex = () => {
+    if (!analytics) return;
+
+    // Build lookup from PROMPT_VARIANTS for academic refs
+    const variantMap = Object.fromEntries(PROMPT_VARIANTS.map((v) => [v.id, v]));
+
+    const rows = analytics.variantBreakdown.map((v) => {
+      const ref = variantMap[v.id]?.academicRef ?? "";
+      return `    ${v.id} & ${v.tag} & ${v.total} & ${v.accuracy}\\% & ${v.avgTime} & \\cite{${ref}} \\\\`;
+    }).join("\n");
+
+    const latex = `\\begin{table}[htbp]
+  \\centering
+  \\caption{Experiment 1: Prompt Paradigm Sensitivity Analysis for Visual Place Recognition (VPR). Five canonical prompting strategies are compared across accuracy (Top-1) and average latency. P1 (Zero-Shot) serves as the baseline.}
+  \\label{tab:exp1_prompt_sensitivity}
+  \\begin{tabular}{l l r r r l}
+    \\toprule
+    \\textbf{ID} & \\textbf{Paradigm} & \\textbf{N} & \\textbf{Acc. (\\%)} & \\textbf{Latency (ms)} & \\textbf{Reference} \\\\
+    \\midrule
+${rows}
+    \\bottomrule
+  \\end{tabular}
+  \\medskip\\par
+  \\small\\textit{Note: All runs use temperature = 0.1 for reproducibility. P1 acts as the Zero-Shot baseline for $\\Delta$Acc comparisons.}
+\\end{table}`;
+
+    navigator.clipboard.writeText(latex);
+    setCopiedLatex(true);
+    toast.success("Prompt Sensitivity LaTeX Table copied!");
+    setTimeout(() => setCopiedLatex(false), 2000);
+  };
+
+  // Export Full CSV for thesis analysis / Python script
+  const exportFullCSV = () => {
+    const records = dbLogs.length > 0 ? dbLogs : currentResults.map((r) => ({
+      timestamp: new Date().toISOString(),
+      image_name: imageFile?.name || "current_trial",
+      ground_truth: groundTruth,
+      tier: r.tier || singleTier,
+      model: r.modelLabel,
+      variant_id: r.variant_id,
+      variant_name: r.variant_name,
+      predicted: r.predicted,
+      confidence: r.confidence,
+      time_ms: r.time_ms,
+      is_correct: r.is_correct,
+      reasoning: r.reasoning,
+      failure_mode: r.failure_mode,
+      temperature: r.temperature ?? 0.1,
+      prompt_tokens: r.prompt_tokens,
+      completion_tokens: r.completion_tokens,
+      total_tokens: r.total_tokens,
+      cost_usd: r.cost_usd,
+      tokens_per_sec: r.tokens_per_sec,
+    }));
+
+    if (records.length === 0) {
+      toast.error("No prompt sensitivity records available to export.");
+      return;
+    }
+
+    const headers = [
+      "Timestamp",
+      "Image Name",
+      "Ground Truth",
+      "Tier",
+      "Model",
+      "Prompt Variant ID",
+      "Prompt Variant Name",
+      "Predicted Place",
+      "Confidence",
+      "Time MS",
+      "Is Correct",
+      "Recall Rank",
+      "Matched Alias",
+      "AI Reasoning",
+      "Temperature",
+      "Failure Mode",
+      "Prompt Tokens",
+      "Completion Tokens",
+      "Total Tokens",
+      "Cost USD",
+      "Tokens Per Sec",
+      "Generation Time MS",
+      "Pure Tokens Per Sec",
+      "Provider Name",
+      "OpenRouter ID",
+    ];
+
+    const rows = records.map((log) => [
+      log.timestamp,
+      log.image_name || "",
+      log.ground_truth || "",
+      normalizeTier(log.tier),
+      log.model,
+      log.variant_id || "",
+      log.variant_name || "",
+      log.predicted || "",
+      log.confidence !== undefined ? Number(log.confidence).toFixed(4) : "",
+      log.time_ms,
+      isTruthy(log.is_correct) ? "True" : "False",
+      log.recall_rank !== undefined ? log.recall_rank : (isTruthy(log.is_correct) ? 1 : 0),
+      log.matched_alias || "",
+      log.reasoning || "",
+      log.temperature ?? 0.1,
+      log.failure_mode || "none",
+      log.prompt_tokens ?? "",
+      log.completion_tokens ?? "",
+      log.total_tokens ?? "",
+      log.cost_usd !== undefined ? Number(log.cost_usd).toFixed(6) : "",
+      log.tokens_per_sec !== undefined ? Number(log.tokens_per_sec).toFixed(2) : "",
+      log.generation_time_ms ?? "",
+      log.pure_tokens_per_sec !== undefined ? Number(log.pure_tokens_per_sec).toFixed(2) : "",
+      log.provider_name || "",
+      log.openrouter_id || "",
+    ]);
+
+    const filename = `VPR_Thesis_Exp1_PromptSensitivity_${new Date().toISOString().slice(0, 10)}.csv`;
+    downloadCsv(filename, headers, rows);
+    toast.success(`Exported ${rows.length} Exp1 records to CSV!`);
+  };
+
+  return (
+    <ExperimentLayout activeTab="exp1">
+      <div className="space-y-6">
+        {/* Header Title */}
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+          <div className="text-left">
+            <div className="flex items-center gap-2">
+              <h2 className="text-xl font-bold text-slate-900 tracking-tight">
+                Experiment 1: Prompt Engineering & Sensitivity Analysis
+              </h2>
+              <Badge className="bg-purple-50 text-purple-700 border-purple-200 text-xs font-semibold">
+                Thesis Chap. 4.1
+              </Badge>
+            </div>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Compare 5 canonical prompt paradigms: Zero-Shot, Persona, Chain-of-Thought, Cross-Lingual, Few-Shot — each testing a distinct dimension of VLM capability.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={exportFullCSV}
+              className="text-xs bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50 shadow-2xs h-8"
+            >
+              <Download className="w-3.5 h-3.5 mr-1 text-emerald-600" />
+              Download Full CSV
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={copyPromptLatex}
+              disabled={!analytics}
+              className="text-xs bg-white text-purple-700 border-purple-200 hover:bg-purple-50 shadow-2xs h-8"
+            >
+              {copiedLatex ? <Check className="w-3.5 h-3.5 mr-1 text-emerald-600" /> : <FileCode2 className="w-3.5 h-3.5 mr-1 text-purple-600" />}
+              {copiedLatex ? "Copied LaTeX" : "Export Prompt LaTeX"}
+            </Button>
+          </div>
+        </div>
+
+        {/* Executive Summary Takeaways Card */}
+        <KeyTakeawaysCard expId="exp1" />
+
+        {/* Top Hero KPI Dashboard */}
+        {analytics && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5">
+              {analytics.variantBreakdown.map((v) => (
+                <Card key={v.id} className="bg-white border-slate-200/90 shadow-xs text-left">
+                  <CardContent className="p-4">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                        {v.id} Strategy
+                      </span>
+                      <Badge className="text-[9px] font-mono px-1.5 py-0" style={{ backgroundColor: `${v.color}15`, color: v.color, borderColor: `${v.color}30` }}>
+                        {v.tag}
+                      </Badge>
+                    </div>
+                    <p className="text-2xl font-extrabold mt-2" style={{ color: v.color }}>
+                      {v.accuracy}%
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-1 font-mono">
+                      Avg: {v.avgTime} ms ({v.total} tests)
+                    </p>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+
+            {/* Winner Banner & Bar Chart / Matrix Switcher */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              {/* Variant Comparison Bar Chart / Matrix (8 cols) */}
+              <Card className="lg:col-span-8 bg-white border-slate-200 shadow-sm text-left">
+                <CardHeader className="pb-2 border-b border-slate-100">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <CardTitle className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <BarChart3 className="w-4 h-4 text-purple-600" />
+                      {promptView === "bar"
+                        ? "Accuracy by Prompt Formulation"
+                        : "Model × Prompt Strategy Matrix Heatmap"}
+                    </CardTitle>
+
+                    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
+                      <Button
+                        variant={promptView === "bar" ? "default" : "ghost"}
+                        size="sm"
+                        onClick={() => setPromptView("bar")}
+                        className={`text-[10px] h-6 px-2 rounded-lg font-semibold ${
+                          promptView === "bar" ? "bg-white text-purple-700 shadow-xs hover:bg-white" : "text-slate-600"
+                        }`}
+                      >
+                        Bar Chart
+                      </Button>
+                      <Button
+                        variant={promptView === "matrix" ? "default" : "ghost"}
+                        size="sm"
+                        onClick={() => setPromptView("matrix")}
+                        className={`text-[10px] h-6 px-2 rounded-lg font-semibold ${
+                          promptView === "matrix" ? "bg-white text-purple-700 shadow-xs hover:bg-white" : "text-slate-600"
+                        }`}
+                      >
+                        Model Matrix
+                      </Button>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  {promptView === "bar" ? (
+                    <div className="h-64 w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={analytics.variantBreakdown} margin={{ top: 15, right: 20, left: -20, bottom: 20 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                          <ReferenceLine
+                            y={analytics.variantBreakdown[0]?.accuracy || 80}
+                            stroke="#6366f1"
+                            strokeDasharray="3 3"
+                            label={{
+                              value: "P1 Baseline",
+                              position: "right",
+                              fill: "#6366f1",
+                              fontSize: 9,
+                            }}
+                          />
+                          <XAxis dataKey="name" tick={{ fontSize: 10 }} angle={-10} textAnchor="end" interval={0} />
+                          <YAxis tickFormatter={(v) => `${v}%`} tick={{ fontSize: 10 }} domain={[0, 100]} />
+                          <RechartsTooltip
+                            content={({ active, payload }) => {
+                              if (active && payload && payload.length) {
+                                const data = payload[0].payload;
+                                return (
+                                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-lg text-xs space-y-1.5 text-left">
+                                    <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-1">
+                                      <p className="font-bold text-slate-900">{data.name}</p>
+                                      <Badge variant="outline" className="text-[9px]" style={{ color: data.color, borderColor: data.color }}>
+                                        {data.tag}
+                                      </Badge>
+                                    </div>
+                                    <p className="text-purple-600 font-semibold flex items-center justify-between">
+                                      <span>Accuracy:</span>
+                                      <span className="font-bold font-mono">{data.accuracy}%</span>
+                                    </p>
+                                    <p className="text-slate-600 font-mono flex items-center justify-between gap-4">
+                                      <span>Avg Latency:</span>
+                                      <span>{data.avgTime} ms</span>
+                                    </p>
+                                    <p className="text-[10px] text-slate-500 pt-1 leading-relaxed">
+                                      {data.description}
+                                    </p>
+                                  </div>
+                                );
+                              }
+                              return null;
+                            }}
+                          />
+                          <Bar dataKey="accuracy" radius={[6, 6, 0, 0]}>
+                            {analytics.variantBreakdown.map((entry, idx) => (
+                              <Cell key={idx} fill={entry.color} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto rounded-xl border border-slate-200">
+                      <Table>
+                        <TableHeader className="bg-slate-50">
+                          <TableRow className="border-b border-slate-200 text-xs">
+                            <TableHead className="py-2">Model</TableHead>
+                            {PROMPT_VARIANTS.map((v) => (
+                              <TableHead key={v.id} className="py-2 text-center" style={{ color: VARIANT_COLORS[v.id] }}>
+                                {v.id} ({v.tag})
+                              </TableHead>
+                            ))}
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {analytics.matrixRows.map((row) => (
+                            <TableRow key={row.model} className="border-b border-slate-100 text-xs">
+                              <TableCell className="font-semibold text-slate-800 py-2">{row.modelLabel}</TableCell>
+                              {PROMPT_VARIANTS.map((v) => {
+                                const val = row[v.id];
+                                return (
+                                  <TableCell key={v.id} className="text-center py-2">
+                                    {val !== null ? (
+                                      <Badge
+                                        className="text-[10px] font-mono px-2 py-0.5 border"
+                                        style={{
+                                          backgroundColor: val >= 80 ? "#dcfce7" : val >= 50 ? "#eff6ff" : "#fee2e2",
+                                          color: val >= 80 ? "#166534" : val >= 50 ? "#1e40af" : "#991b1b",
+                                          borderColor: val >= 80 ? "#86efac" : val >= 50 ? "#bfdbfe" : "#fca5a5",
+                                        }}
+                                      >
+                                        {val}%
+                                      </Badge>
+                                    ) : (
+                                      <span className="text-slate-300 text-xs">-</span>
+                                    )}
+                                  </TableCell>
+                                );
+                              })}
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Best Strategy Callout */}
+              <Card className="lg:col-span-4 bg-gradient-to-br from-purple-900 to-indigo-950 text-white shadow-sm text-left flex flex-col justify-between">
+                <CardHeader className="pb-2">
+                  <div className="flex items-center gap-2">
+                    <Trophy className="w-5 h-5 text-amber-400" />
+                    <CardTitle className="text-sm font-bold text-white">
+                      Recommended Formulation
+                    </CardTitle>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-3 pb-6">
+                  <div>
+                    <span className="text-[10px] uppercase font-bold text-purple-300">Optimal Prompt Paradigm</span>
+                    <p className="text-xl font-extrabold text-white mt-0.5">
+                      {analytics.bestVariant.name}
+                    </p>
+                    <p className="text-xs text-purple-200 mt-1 font-mono">
+                      Yielded {analytics.bestVariant.accuracy}% Accuracy ({analytics.bestVariant.avgTime} ms avg)
+                    </p>
+                  </div>
+                  <p className="text-[11px] text-purple-200/80 leading-relaxed">
+                    💡 <strong>Thesis Discussion:</strong> Step-by-step visual reasoning (CoT) & few-shot grounding significantly reduce hallucination on ambiguous tourism photos.
+                  </p>
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+        )}
+
+        {/* Main 2-Column Test Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          {/* Left Column: SETUP (4-5 cols) */}
+          <div className="lg:col-span-5 xl:col-span-4 space-y-6">
+            <Card className="bg-white border-slate-200 shadow-sm text-left">
+              <CardHeader className="border-b border-slate-100 pb-4">
+                <CardTitle className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Sliders className="w-4 h-4 text-purple-600" />
+                  1. Test Image & Prompt Variants
+                </CardTitle>
+                <CardDescription className="text-xs text-slate-500">
+                  Select a single image to test across 5 prompt engineering variants.
+                </CardDescription>
+              </CardHeader>
+
+              <CardContent className="pt-6 space-y-5">
+                {/* Upload Image */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs font-semibold text-slate-700">Query Image</Label>
+                  <div className="border-2 border-dashed border-slate-200 hover:border-purple-400 rounded-2xl p-4 text-center cursor-pointer transition-all bg-slate-50/50">
+                    <Input type="file" accept="image/*" onChange={handleFileChange} className="hidden" id="exp4-file" disabled={isRunning} />
+                    <label htmlFor="exp4-file" className="cursor-pointer block">
+                      {imagePreview ? (
+                        <div className="relative group">
+                          <img src={imagePreview} alt="Preview" className="max-h-40 mx-auto rounded-lg object-cover shadow-xs" />
+                          <div className="absolute inset-0 bg-slate-900/10 opacity-0 group-hover:opacity-100 transition-opacity rounded-lg flex items-center justify-center">
+                            <span className="text-[11px] bg-white text-slate-700 px-2.5 py-1 rounded-full shadow-md font-medium">
+                              Change Image
+                            </span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="py-5 space-y-1.5">
+                          <div className="w-9 h-9 rounded-full bg-purple-50 text-purple-600 flex items-center justify-center mx-auto">
+                            <Upload className="w-4 h-4" />
+                          </div>
+                          <p className="text-xs font-bold text-slate-800">Upload Query Photo</p>
+                        </div>
+                      )}
+                    </label>
+                  </div>
+                </div>
+
+                {/* Ground Truth */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs font-semibold text-slate-700">Ground Truth (Multi-Alias)</Label>
+                  <Input
+                    value={groundTruth}
+                    onChange={(e) => setGroundTruth(e.target.value)}
+                    placeholder="e.g. Wat Arun | Temple of Dawn"
+                    className="bg-white text-xs border-slate-200 text-slate-900"
+                    disabled={isRunning}
+                  />
+                </div>
+
+                {/* Benchmark Tier Category Selector */}
+                <div className="space-y-1.5 text-left">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs font-semibold text-slate-700">Benchmark Tier Stratification</Label>
+                    <Badge className={`${TIER_CONFIGS[singleTier].badgeClass} text-[10px]`}>
+                      {TIER_CONFIGS[singleTier].icon} {TIER_CONFIGS[singleTier].shortLabel}
+                    </Badge>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {TIER_ORDER.map((tierKey) => {
+                      const cfg = TIER_CONFIGS[tierKey];
+                      const isSelected = singleTier === tierKey;
+                      return (
+                        <button
+                          key={tierKey}
+                          type="button"
+                          onClick={() => setSingleTier(tierKey)}
+                          disabled={isRunning}
+                          className={`flex items-start gap-2 p-2.5 rounded-xl border text-left text-xs transition-all cursor-pointer ${
+                            isSelected
+                              ? `${cfg.badgeClass} ring-2 ring-purple-500 font-semibold shadow-xs`
+                              : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50/80"
+                          }`}
+                        >
+                          <span className="text-lg leading-none mt-0.5 shrink-0">{cfg.icon}</span>
+                          <div className="min-w-0 flex-1">
+                            <div className="font-bold text-xs leading-tight text-slate-800">{cfg.shortLabel}</div>
+                            <div className="text-[10px] text-slate-500 line-clamp-2 leading-snug mt-0.5" title={cfg.description}>
+                              {cfg.description}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Multi-Model Selector */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs font-semibold text-slate-700">
+                      Models to Benchmark ({selectedModels.length}/{AI_MODEL_OPTIONS.length})
+                    </Label>
+                    <div className="flex gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setSelectedModels(AI_MODEL_OPTIONS.map((m) => m.value))}
+                        className="text-[10px] h-6 px-1.5 text-slate-500 hover:text-slate-900"
+                        disabled={isRunning}
+                      >
+                        All
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setSelectedModels([])}
+                        className="text-[10px] h-6 px-1.5 text-slate-500 hover:text-slate-900"
+                        disabled={isRunning}
+                      >
+                        Clear
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
+                    {AI_MODEL_OPTIONS.map((opt) => {
+                      const isChecked = selectedModels.includes(opt.value);
+                      return (
+                        <div
+                          key={opt.value}
+                          onClick={() => {
+                            if (isRunning) return;
+                            setSelectedModels((prev) =>
+                              prev.includes(opt.value)
+                                ? prev.filter((m) => m !== opt.value)
+                                : [...prev, opt.value]
+                            );
+                          }}
+                          className={`flex items-center gap-2.5 p-2 rounded-lg border text-left cursor-pointer transition-all ${
+                            isChecked
+                              ? "bg-purple-50/40 border-purple-200 text-slate-900"
+                              : "bg-white border-slate-200/80 text-slate-600 hover:bg-slate-50"
+                          }`}
+                        >
+                          <Checkbox
+                            checked={isChecked}
+                            onCheckedChange={() => {}}
+                            className="border-slate-300 data-[state=checked]:bg-purple-600 data-[state=checked]:border-purple-600"
+                            disabled={isRunning}
+                          />
+                          <img src={opt.icon} className="w-4 h-4 rounded-full object-cover shrink-0 bg-slate-100 border border-slate-200" alt="" />
+                          <div className="min-w-0 flex-1">
+                            <span className="text-xs font-semibold text-slate-800 block truncate">{opt.label}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Prompt Variants Checkboxes & Prompt Viewer */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs font-semibold text-slate-700">
+                      Prompt Variants to Compare ({selectedVariants.length}/{PROMPT_VARIANTS.length})
+                    </Label>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={isRunning}
+                        onClick={() => {
+                          const allExpanded = PROMPT_VARIANTS.every((v) => expandedPrompts[v.id]);
+                          const nextState: Record<string, boolean> = {};
+                          PROMPT_VARIANTS.forEach((v) => {
+                            nextState[v.id] = !allExpanded;
+                          });
+                          setExpandedPrompts(nextState);
+                        }}
+                        className="text-[11px] text-purple-600 hover:text-purple-700 font-medium transition-colors"
+                      >
+                        {PROMPT_VARIANTS.every((v) => expandedPrompts[v.id]) ? "Collapse Prompts" : "Expand All"}
+                      </button>
+                      <span className="text-slate-300">|</span>
+                      <button
+                        type="button"
+                        disabled={isRunning}
+                        onClick={() =>
+                          setSelectedVariants(
+                            selectedVariants.length === PROMPT_VARIANTS.length
+                              ? []
+                              : PROMPT_VARIANTS.map((v) => v.id)
+                          )
+                        }
+                        className="text-[11px] text-purple-600 hover:text-purple-700 font-medium transition-colors"
+                      >
+                        {selectedVariants.length === PROMPT_VARIANTS.length ? "Deselect All" : "Select All"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2.5 max-h-[36rem] overflow-y-auto pr-1.5 custom-scrollbar">
+                    {PROMPT_VARIANTS.map((v) => {
+                      const isChecked = selectedVariants.includes(v.id);
+                      const isExpanded = expandedPrompts[v.id] ?? true;
+                      const promptString = v.promptText(groundTruth);
+
+                      return (
+                        <div
+                          key={v.id}
+                          onClick={() => {
+                            if (isRunning) return;
+                            setSelectedVariants((prev) =>
+                              prev.includes(v.id) ? prev.filter((id) => id !== v.id) : [...prev, v.id]
+                            );
+                          }}
+                          className={`p-3 rounded-xl border transition-all cursor-pointer ${
+                            isChecked
+                              ? "bg-purple-50/40 border-purple-200 shadow-xs"
+                              : "bg-slate-50/40 border-slate-200/60 opacity-80"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <Checkbox
+                                checked={isChecked}
+                                onCheckedChange={() => {}}
+                                className="border-slate-300 data-[state=checked]:bg-purple-600 data-[state=checked]:border-purple-600 shrink-0"
+                                disabled={isRunning}
+                              />
+                              <span className="text-xs font-bold text-slate-800 truncate">{v.name}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <Badge
+                                className="text-[9px] font-mono px-1.5 py-0"
+                                style={{
+                                  color: VARIANT_COLORS[v.id],
+                                  backgroundColor: `${VARIANT_COLORS[v.id]}15`,
+                                }}
+                              >
+                                {v.tag}
+                              </Badge>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setExpandedPrompts((prev) => ({ ...prev, [v.id]: !isExpanded }));
+                                }}
+                                className="text-slate-400 hover:text-slate-600 p-0.5 rounded transition-colors"
+                                title={isExpanded ? "Collapse prompt" : "Expand prompt"}
+                              >
+                                {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                              </button>
+                            </div>
+                          </div>
+
+                          <p className="text-[10.5px] text-slate-500 mt-1 pl-6 leading-normal">{v.description}</p>
+                          <p className="text-[9px] text-slate-400 mt-0.5 pl-6 font-mono italic">📚 {v.academicRef}</p>
+
+                          {/* Prompt Display Box */}
+                          {isExpanded && (
+                            <div
+                              className="mt-2.5 pl-6"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <div className="bg-slate-900/[0.04] border border-slate-200/90 rounded-lg p-2.5">
+                                <div className="flex items-center justify-between pb-1.5 mb-1.5 border-b border-slate-200/60">
+                                  <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-600">
+                                    <Terminal className="w-3 h-3 text-purple-600" />
+                                    <span>Prompt Template ({v.id})</span>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleCopyPrompt(e, v.id, promptString)}
+                                    className="flex items-center gap-1 text-[9.5px] text-slate-500 hover:text-purple-600 font-medium px-1.5 py-0.5 rounded hover:bg-white/80 transition-all border border-transparent hover:border-slate-200"
+                                    title="Copy full prompt text"
+                                  >
+                                    {copiedVariantId === v.id ? (
+                                      <>
+                                        <Check className="w-2.5 h-2.5 text-emerald-600" />
+                                        <span className="text-emerald-600 font-bold">Copied</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy className="w-2.5 h-2.5 text-slate-400" />
+                                        <span>Copy</span>
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                                <pre className="font-mono text-[10px] text-slate-700 leading-relaxed whitespace-pre-wrap select-text break-words max-h-36 overflow-y-auto">
+                                  {promptString}
+                                </pre>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Run Button */}
+                <Button
+                  onClick={runPromptSensitivityTest}
+                  disabled={
+                    isRunning ||
+                    !imageFile ||
+                    !groundTruth.trim() ||
+                    selectedVariants.length === 0 ||
+                    selectedModels.length === 0
+                  }
+                  className="w-full bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white font-semibold text-xs py-5 rounded-xl shadow-md flex items-center justify-center gap-2"
+                >
+                  <Play className="w-4 h-4" />
+                  <span>
+                    {isRunning
+                      ? progressLabel
+                      : `Run Prompt Comparison (${selectedVariants.length} Prompts × ${selectedModels.length} Models = ${
+                          selectedVariants.length * selectedModels.length
+                        } Trials)`}
+                  </span>
+                </Button>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Right Column: RESULTS & AI REASONING INSPECTION (7-8 cols) */}
+          <div className="lg:col-span-7 xl:col-span-8 space-y-6">
+            <Card className="bg-white border-slate-200 shadow-sm text-left">
+              <CardHeader className="flex flex-row items-center justify-between pb-4 border-b border-slate-100">
+                <div>
+                  <CardTitle className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                    <MessageSquare className="w-4 h-4 text-purple-600" />
+                    Prompt Variant Predictions & Reasoning
+                  </CardTitle>
+                  <CardDescription className="text-xs text-slate-500">
+                    Compare responses and inspect intermediate AI deduction logic.
+                  </CardDescription>
+                </div>
+                {currentResults.length > 0 && (
+                  <Button
+                    onClick={commitResults}
+                    size="sm"
+                    className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs h-8 shadow-xs"
+                  >
+                    <Save className="w-3.5 h-3.5 mr-1" />
+                    Commit to CSV
+                  </Button>
+                )}
+              </CardHeader>
+
+              <CardContent className="pt-6">
+                {currentResults.length === 0 ? (
+                  <div className="text-center py-16 text-slate-400 border border-dashed border-slate-200 rounded-2xl">
+                    <Sliders className="w-8 h-8 mx-auto mb-2 text-slate-350" />
+                    <p className="text-xs font-semibold text-slate-600">No prompt sensitivity results yet.</p>
+                    <p className="text-[10px] text-slate-400 mt-1">Upload a photo and click Run Prompt Comparison.</p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
+                    <Table>
+                      <TableHeader className="bg-slate-50">
+                        <TableRow className="border-b border-slate-200 text-xs">
+                          <TableHead className="py-2.5">Model</TableHead>
+                          <TableHead className="py-2.5">Variant</TableHead>
+                          <TableHead className="py-2.5">Tier</TableHead>
+                          <TableHead className="py-2.5 min-w-[220px]">Prediction</TableHead>
+                          <TableHead className="py-2.5 text-center">Tokens (In / Out)</TableHead>
+                          <TableHead className="py-2.5 text-center">Cost ($)</TableHead>
+                          <TableHead className="py-2.5 text-center">Latency</TableHead>
+                          <TableHead className="py-2.5 text-center">Reasoning</TableHead>
+                          <TableHead className="py-2.5 text-center">Verdict (Double-Check)</TableHead>
+                          <TableHead className="py-2.5 text-center">Failure Mode</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {currentResults.map((r, idx) => (
+                          <TableRow key={idx} className="border-b border-slate-100 text-xs">
+                            <TableCell className="font-semibold text-slate-800 py-2.5 text-xs whitespace-nowrap">
+                              {r.modelLabel}
+                            </TableCell>
+                            <TableCell className="font-bold text-slate-800 py-2.5">
+                              <span style={{ color: VARIANT_COLORS[r.variant_id] }}>{r.variant_id}</span>
+                              <span className="text-[10px] text-slate-400 block font-normal">{r.variant_name.split(": ")[1]}</span>
+                            </TableCell>
+                            <TableCell className="py-2.5">
+                              {(() => {
+                                const cfg = TIER_CONFIGS[normalizeTier(r.tier || singleTier)];
+                                return (
+                                  <Badge className={`${cfg.badgeClass} text-[9px] px-1.5 py-0.5 font-medium`}>
+                                    {cfg.icon} {cfg.shortLabel}
+                                  </Badge>
+                                );
+                              })()}
+                            </TableCell>
+                            <TableCell className="py-2.5 min-w-[220px]">
+                              <span className="font-semibold text-slate-900 block break-words" title={r.predicted}>{r.predicted}</span>
+                              {r.matched_alias && (
+                                <span className="text-[10px] text-emerald-600 block">Matched: "{r.matched_alias}"</span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-center font-mono text-[11px] text-slate-700 py-2.5">
+                              <span className="font-semibold text-slate-800">{r.prompt_tokens ?? 0}</span>
+                              <span className="text-slate-400"> / </span>
+                              <span className="font-semibold text-blue-600">{r.completion_tokens ?? 0}</span>
+                            </TableCell>
+                            <TableCell className="text-center font-mono text-[11px] text-emerald-700 font-semibold py-2.5">
+                              ${(r.cost_usd ?? 0).toFixed(6)}
+                            </TableCell>
+                            <TableCell className="text-center font-mono text-[11px] text-slate-600 py-2.5">
+                              {r.time_ms} ms
+                            </TableCell>
+                            <TableCell className="text-center py-2.5">
+                              {r.reasoning ? (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => setActiveReasoning({ name: r.variant_name, text: r.reasoning })}
+                                  className="h-6 text-[10px] px-2 text-purple-600 hover:bg-purple-50"
+                                >
+                                  <Eye className="w-3 h-3 mr-1" />
+                                  Inspect
+                                </Button>
+                              ) : (
+                                <span className="text-slate-300">-</span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-center py-2.5">
+                              <HumanDoubleCheckButton
+                                isCorrect={r.is_correct}
+                                matchScore={r.match_score}
+                                matchedAlias={r.matched_alias}
+                                isVerified={r.user_verified}
+                                onChange={(val) => updateCorrectness(idx, val)}
+                              />
+                            </TableCell>
+                            <TableCell className="text-center py-2.5">
+                              {r.is_correct ? (
+                                <Badge variant="outline" className="bg-emerald-50 text-emerald-700 text-[10px] border-emerald-200">
+                                  ✓ None
+                                </Badge>
+                              ) : (
+                                <select
+                                  value={r.failure_mode || "visual_confusion"}
+                                  onChange={(e) => updateFailureMode(idx, e.target.value as FailureMode)}
+                                  className="text-[10px] bg-rose-50 border border-rose-200 text-rose-800 rounded px-1.5 py-1 font-semibold focus:outline-none focus:ring-1 focus:ring-rose-400"
+                                >
+                                  <option value="visual_confusion">👁️ Visual Confusion</option>
+                                  <option value="hallucination_overconfidence">🌀 Hallucination</option>
+                                  <option value="unidentifiable_scene">❓ Unidentifiable</option>
+                                </select>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Historical Log */}
+            <Card className="bg-white border-slate-200 shadow-sm text-left">
+              <CardHeader className="pb-3 border-b border-slate-100 flex flex-row items-center justify-between">
+                <div>
+                  <CardTitle className="text-sm font-bold text-slate-900">
+                    Historical Prompt Records ({dbLogs.length} trials)
+                  </CardTitle>
+                </div>
+                {(dbLogs.length > 0 || currentResults.length > 0) && (
+                  <Button
+                    onClick={exportFullCSV}
+                    variant="outline"
+                    size="sm"
+                    className="text-xs bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50 shadow-2xs h-8"
+                  >
+                    <Download className="w-3.5 h-3.5 mr-1 text-emerald-600" />
+                    Download Full CSV
+                  </Button>
+                )}
+              </CardHeader>
+              <CardContent className="pt-4 max-h-60 overflow-y-auto">
+                {dbLogs.length === 0 ? (
+                  <p className="text-xs text-slate-400 text-center py-6">No historical records saved yet.</p>
+                ) : (
+                  <Table>
+                    <TableHeader className="bg-slate-50 sticky top-0 z-10">
+                      <TableRow className="border-b border-slate-200 text-xs">
+                        <TableHead className="py-2">Variant</TableHead>
+                        <TableHead className="py-2">Tier</TableHead>
+                        <TableHead className="py-2">Model</TableHead>
+                        <TableHead className="py-2 min-w-[200px]">Prediction</TableHead>
+                        <TableHead className="py-2 text-center">Failure Mode</TableHead>
+                        <TableHead className="py-2 text-right">Result</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {dbLogs.map((row, i) => (
+                        <TableRow key={i} className="border-b border-slate-100 text-xs">
+                          <TableCell className="py-2 font-bold" style={{ color: VARIANT_COLORS[row.variant_id] || "#6366f1" }}>
+                            {row.variant_id}
+                          </TableCell>
+                          <TableCell className="py-2">
+                            {(() => {
+                              const cfg = TIER_CONFIGS[normalizeTier(row.tier)];
+                              return (
+                                <Badge className={`${cfg.badgeClass} text-[9px] px-1.5 py-0.5 font-medium`}>
+                                  {cfg.icon} {cfg.shortLabel}
+                                </Badge>
+                              );
+                            })()}
+                          </TableCell>
+                          <TableCell className="py-2 font-medium text-slate-800">{row.model}</TableCell>
+                          <TableCell className="py-2 text-slate-700 min-w-[200px] break-words" title={row.predicted}>{row.predicted}</TableCell>
+                          <TableCell className="py-2 text-center">
+                            {isTruthy(row.is_correct) ? (
+                              <span className="text-slate-400 text-xs font-mono">-</span>
+                            ) : (
+                              (() => {
+                                const fm = (row.failure_mode as FailureMode) || "visual_confusion";
+                                const cfg = FAILURE_MODE_CONFIGS[fm] || FAILURE_MODE_CONFIGS["visual_confusion"];
+                                return (
+                                  <Badge className={`${cfg.badgeClass} text-[9px] px-1.5 py-0.5 font-medium`}>
+                                    {cfg.icon} {cfg.shortLabel}
+                                  </Badge>
+                                );
+                              })()
+                            )}
+                          </TableCell>
+                          <TableCell className="py-2 text-right">
+                            {isTruthy(row.is_correct) ? (
+                              <Badge className="bg-emerald-50 text-emerald-700 border-none text-[9px]">✓ Correct</Badge>
+                            ) : (
+                              <Badge className="bg-rose-50 text-rose-700 border-none text-[9px]">✗ Miss</Badge>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+
+      {/* AI Reasoning Modal Dialog */}
+      <Dialog open={!!activeReasoning} onOpenChange={(open) => !open && setActiveReasoning(null)}>
+        <DialogContent className="max-w-xl bg-white text-slate-900">
+          <DialogHeader>
+            <DialogTitle className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <Eye className="w-4 h-4 text-purple-600" />
+              {activeReasoning?.name} — AI Reasoning Output
+            </DialogTitle>
+            <DialogDescription className="text-xs text-slate-500">
+              Intermediate chain-of-thought deduction steps generated by the VLM.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 max-h-72 overflow-y-auto text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">
+            {activeReasoning?.text}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </ExperimentLayout>
+  );
+}
